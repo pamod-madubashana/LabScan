@@ -1,0 +1,31 @@
+# Tauri
+/admin/src-tauri/target/
+/admin/src-tauri/**/*.dll
+/admin/src-tauri/**/*.exe
+/admin/src-tauri/**/*.dmg
+/admin/src-tauri/**/*.app
+/admin/node_modules/
+
+# Go
+/agent/bin/
+/agent/labscan-agent
+/agent/labscan-agent.exe
+/agent/go.mod
+/agent/go.sum
+
+# Certificates and database
+/certs/
+*.db
+*.sqlite
+*.key
+*.crt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
