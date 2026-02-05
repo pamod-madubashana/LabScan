@@ -1,7 +1,7 @@
 [package]
-name = "labscan-admin"
+name = "labscan"
 version = "0.1.0"
-description = "LabScan Admin Dashboard"
+description = "LabScan"
 authors = ["you"]
 license = ""
 repository = ""
