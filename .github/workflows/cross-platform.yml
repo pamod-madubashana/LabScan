@@ -1,4 +1,4 @@
-name: Build & Release Tauri App
+name: Build & Release LabScan App
 
 on:
   push:
@@ -28,6 +28,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # Install Go for agent building
+          sudo apt-get install -y golang-go
         shell: bash
 
       - name: Read version from VERSION file
@@ -81,14 +83,18 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
+          workspaces: './admin/src-tauri -> target'
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install frontend dependencies
+        run: |
+          cd admin
+          npm install
         shell: bash
 
       - name: Install Tauri CLI
-        run: npm install -g @tauri-apps/cli
+        run: |
+          cd admin
+          npm install -g @tauri-apps/cli
         shell: bash
 
       # macOS needs extra setup for signing disabled
@@ -100,11 +106,23 @@ jobs:
         shell: bash
 
       - name: Build Tauri app
-        run: npm run tauri build
+        run: |
+          cd admin
+          npm run tauri build
         shell: bash
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+
+      - name: Build Go Agent
+        run: |
+          cd agent
+          go build -o labscan-agent .
+          # Cross-compile for different platforms
+          GOOS=windows GOARCH=amd64 go build -o labscan-agent-windows-amd64.exe .
+          GOOS=linux GOARCH=amd64 go build -o labscan-agent-linux-amd64 .
+          GOOS=darwin GOARCH=amd64 go build -o labscan-agent-darwin-amd64 .
+        shell: bash
 
       - name: Upload Release
         uses: softprops/action-gh-release@v1
@@ -115,13 +133,27 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            src-tauri/target/release/net-watch*
-            src-tauri/target/release/bundle/msi/*.msi
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/macos/*.app
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+            admin/src-tauri/target/release/labscan*
+            admin/src-tauri/target/release/bundle/msi/*.msi
+            admin/src-tauri/target/release/bundle/nsis/*.exe
+            admin/src-tauri/target/release/bundle/dmg/*.dmg
+            admin/src-tauri/target/release/bundle/macos/*.app
+            admin/src-tauri/target/release/bundle/appimage/*.AppImage
+            admin/src-tauri/target/release/bundle/deb/*.deb
+            admin/src-tauri/target/release/bundle/rpm/*.rpm
+            agent/labscan-agent*
+            agent/labscan-agent-windows-amd64.exe
+            agent/labscan-agent-linux-amd64
+            agent/labscan-agent-darwin-amd64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Agent Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-binaries
+          path: |
+            agent/labscan-agent*
+            agent/labscan-agent-windows-amd64.exe
+            agent/labscan-agent-linux-amd64
+            agent/labscan-agent-darwin-amd64

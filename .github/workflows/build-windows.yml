@@ -1,4 +1,4 @@
-name: Build Tauri Windows App
+name: Build LabScan Windows App
 
 on:
   push:
@@ -30,16 +30,22 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
+          workspaces: './admin/src-tauri -> target'
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install frontend dependencies
+        run: |
+          cd admin
+          npm install
 
       - name: Install Tauri CLI
-        run: npm install -g @tauri-apps/cli
+        run: |
+          cd admin
+          npm install -g @tauri-apps/cli
 
       - name: Build Tauri app
-        run: npm run tauri build
+        run: |
+          cd admin
+          npm run tauri build
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
@@ -48,19 +54,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-msi-installer
-          path: src-tauri/target/release/bundle/msi/*.msi
+          path: admin/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: warn
 
       - name: Upload Windows installer (NSIS)
         uses: actions/upload-artifact@v4
         with:
           name: windows-nsis-installer
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          path: admin/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: warn
 
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
           name: windows-executable
-          path: src-tauri/target/release/*.exe
+          path: admin/src-tauri/target/release/*.exe
           if-no-files-found: warn
