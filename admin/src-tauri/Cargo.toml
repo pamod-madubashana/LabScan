@@ -1,0 +1,36 @@
+[package]
+name = "labscan-admin"
+version = "0.1.0"
+description = "LabScan Admin Dashboard"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+openssl = { version = "0.10", features = ["vendored"] }
+rcgen = "0.13"
+mdns-sd = "0.11"
+socket2 = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+rustls = "0.23"
+rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
