@@ -108,9 +108,29 @@ agent/
 
 ## Requirements
 
-- **Admin**: Node.js 18+, Rust 1.70+
+- **Admin Development**: Node.js 18+
+- **Full Tauri Build**: Rust 1.70+ (cargo), Tauri CLI
 - **Agent**: Go 1.21+ (or pre-built binary)
 - **Network**: UDP multicast support on LAN
+
+## Development Setup
+
+### Frontend Development Only
+```bash
+cd admin
+npm install
+npm run dev  # Runs React app on http://localhost:5173
+```
+
+### Full Tauri Desktop App
+```bash
+# Install Rust first: https://www.rust-lang.org/tools/install
+cd admin
+npm install
+npm run tauri dev  # Runs Tauri app with Rust backend
+```
+
+**Note**: For full Tauri functionality, you need Rust installed on your system.
 
 ## Limitations
 
