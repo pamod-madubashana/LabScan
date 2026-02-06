@@ -2,7 +2,7 @@
 name = "labscan"
 version = "0.1.0"
 description = "LabScan"
-authors = ["you"]
+authors = ["pamod-madubashana"]
 license = ""
 repository = ""
 edition = "2021"
