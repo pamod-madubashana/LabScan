@@ -1,47 +1,42 @@
 # LabScan Agent
 
-## Building
+Headless Go service/daemon that connects to the LabScan admin server over websocket.
+
+## Build
 
 ```bash
-# Build for current platform
-go build -o labscan-agent
-
-# Build for Windows
-GOOS=windows GOARCH=amd64 go build -o labscan-agent.exe
-
-# Build for Linux
-GOOS=linux GOARCH=amd64 go build -o labscan-agent
+cd agent
+go build -o labscan-agent.exe .
 ```
 
-## Running
+## Run
 
-### Auto-discovery mode (recommended):
 ```bash
-./labscan-agent
+labscan-agent.exe -admin-url ws://192.168.1.20:8787/ws/agent -secret labscan-dev-secret
 ```
 
-The agent will:
-1. Listen for UDP multicast beacons from the admin server
-2. Automatically register when it discovers the admin
-3. Begin sending periodic heartbeats
+or just:
 
-### Manual mode:
 ```bash
-./labscan-agent -admin-url https://192.168.1.100:8443 -token YOUR_JOIN_TOKEN
+labscan-agent.exe
 ```
 
-## Configuration
+The first run creates `config.json` with persistent `agent_id`.
 
-The agent creates a `config.json` file with:
-- Device ID (generated UUID)
-- Admin server URL (from discovery or manual config)
-- Join token (from discovery or manual config)
-- TLS fingerprint (for security validation)
+## Config file
 
-## Features
+`config.json` fields:
 
-- **Zero-config discovery**: Clients automatically find the admin server
-- **Secure registration**: Time-limited join tokens prevent unauthorized access
-- **Network monitoring**: Tests gateway connectivity, DNS resolution, and HTTPS latency
-- **Passive operation**: Agent only listens for beacons, doesn't actively scan networks
-- **Cross-platform**: Works on Windows, Linux, and macOS
+- `admin_url` - websocket URL to admin endpoint
+- `agent_id` - stable UUID for this machine
+- `secret` - shared secret used during register
+- `heartbeat_interval_s` - heartbeat cadence
+- `reconnect_min_ms` / `reconnect_max_ms` - reconnect backoff bounds
+
+## Supported task kinds
+
+- `ping` - TCP-connect latency check
+- `port_scan` - timeout-based connect scan for explicit ports
+- `arp_snapshot` - captures `arp -a` (Windows) or `ip neigh` (Linux)
+
+Remote command execution is intentionally disabled.

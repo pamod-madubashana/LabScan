@@ -1,103 +1,78 @@
-import { motion } from "framer-motion";
-import { cn } from "@/lib/utils";
-import { Shield, Bell, Network, Database, Key, Globe, ChevronRight } from "lucide-react";
-import { Switch } from "@/components/ui/switch";
-
-interface SettingsSection {
-  title: string;
-  icon: typeof Shield;
-  items: { label: string; description: string; type: "toggle" | "link"; value?: boolean }[];
-}
-
-const sections: SettingsSection[] = [
-  {
-    title: "Security",
-    icon: Shield,
-    items: [
-      { label: "Auto-block brute force", description: "Automatically block IPs after 5 failed auth attempts", type: "toggle", value: true },
-      { label: "TLS enforcement", description: "Require TLS 1.3 for all agent connections", type: "toggle", value: true },
-      { label: "Certificate management", description: "Manage server and agent certificates", type: "link" },
-    ],
-  },
-  {
-    title: "Notifications",
-    icon: Bell,
-    items: [
-      { label: "Critical alerts", description: "Push notifications for critical severity events", type: "toggle", value: true },
-      { label: "Agent status changes", description: "Notify when agents go offline or reconnect", type: "toggle", value: true },
-      { label: "Scan completions", description: "Alert when scheduled scans finish", type: "toggle", value: false },
-    ],
-  },
-  {
-    title: "Network",
-    icon: Network,
-    items: [
-      { label: "Auto-discovery", description: "Automatically discover new devices on monitored subnets", type: "toggle", value: true },
-      { label: "Heartbeat interval", description: "Configure agent heartbeat frequency (default: 30s)", type: "link" },
-      { label: "Scan profiles", description: "Manage scan configurations and schedules", type: "link" },
-    ],
-  },
-  {
-    title: "Data & Storage",
-    icon: Database,
-    items: [
-      { label: "Log retention", description: "Configure log retention period (default: 90 days)", type: "link" },
-      { label: "Auto-backup", description: "Daily automated backup of scan results and configs", type: "toggle", value: true },
-      { label: "Export data", description: "Export logs, reports, and scan results", type: "link" },
-    ],
-  },
-  {
-    title: "API & Integrations",
-    icon: Key,
-    items: [
-      { label: "REST API", description: "Enable external API access to LabScan data", type: "toggle", value: false },
-      { label: "Webhook endpoints", description: "Configure webhook destinations for events", type: "link" },
-      { label: "SIEM integration", description: "Forward logs to external SIEM platforms", type: "link" },
-    ],
-  },
-];
+import { useState } from "react";
+import { Copy, RefreshCw, Save } from "lucide-react";
+import { useLabScan } from "@/lib/labscan";
 
 const Settings = () => {
+  const { state, updateSharedSecret, generatePairToken } = useLabScan();
+  const [secret, setSecret] = useState(state.settings.shared_secret);
+  const [generated, setGenerated] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const saveSecret = async () => {
+    setSaving(true);
+    try {
+      await updateSharedSecret(secret.trim());
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const createToken = async () => {
+    const token = await generatePairToken();
+    setGenerated(token);
+  };
+
   return (
-    <div className="p-5 max-w-3xl">
-      <div className="mb-5">
+    <div className="p-5 max-w-3xl space-y-4">
+      <div>
         <h2 className="text-lg font-semibold text-foreground">Settings</h2>
-        <p className="text-xs text-muted-foreground font-mono">Server configuration and preferences</p>
+        <p className="text-xs text-muted-foreground font-mono">LAN server settings and pairing security</p>
       </div>
 
-      <div className="space-y-5">
-        {sections.map((section, si) => (
-          <motion.div
-            key={section.title}
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: si * 0.05 }}
-            className="glass-panel overflow-hidden"
+      <div className="glass-panel p-4 space-y-3">
+        <h3 className="text-sm font-medium">Server</h3>
+        <p className="text-xs text-muted-foreground font-mono">
+          Listening on {state.server.bind_addr}:{state.server.port}
+        </p>
+        <p className="text-xs text-muted-foreground">Use Windows Firewall inbound allow rule for TCP {state.server.port}.</p>
+      </div>
+
+      <div className="glass-panel p-4 space-y-3">
+        <h3 className="text-sm font-medium">Shared Secret</h3>
+        <p className="text-xs text-muted-foreground">Agents must provide this secret in the register message.</p>
+        <div className="flex items-center gap-2">
+          <input
+            value={secret}
+            onChange={(event) => setSecret(event.target.value)}
+            className="flex-1 h-9 rounded bg-muted/50 border border-border px-3 text-sm"
+            placeholder="shared secret"
+          />
+          <button
+            onClick={saveSecret}
+            disabled={saving}
+            className="h-9 px-3 rounded-md bg-primary/10 border border-primary/20 text-primary text-xs inline-flex items-center gap-1"
           >
-            <div className="flex items-center gap-2.5 px-4 py-3 border-b border-border/30">
-              <section.icon className="w-4 h-4 text-primary" />
-              <span className="text-sm font-semibold text-foreground">{section.title}</span>
-            </div>
-            <div className="divide-y divide-border/20">
-              {section.items.map((item) => (
-                <div
-                  key={item.label}
-                  className="flex items-center justify-between px-4 py-3 hover:bg-accent/20 transition-colors cursor-pointer"
-                >
-                  <div>
-                    <p className="text-sm text-foreground">{item.label}</p>
-                    <p className="text-xs text-muted-foreground mt-0.5">{item.description}</p>
-                  </div>
-                  {item.type === "toggle" ? (
-                    <Switch defaultChecked={item.value} className="data-[state=checked]:bg-primary" />
-                  ) : (
-                    <ChevronRight className="w-4 h-4 text-muted-foreground" />
-                  )}
-                </div>
-              ))}
-            </div>
-          </motion.div>
-        ))}
+            <Save className="w-3.5 h-3.5" /> {saving ? "Saving" : "Save"}
+          </button>
+        </div>
+      </div>
+
+      <div className="glass-panel p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-medium">Pair Token</h3>
+          <button onClick={createToken} className="h-8 px-3 rounded-md border border-border text-xs inline-flex items-center gap-1">
+            <RefreshCw className="w-3.5 h-3.5" /> Generate
+          </button>
+        </div>
+        <p className="text-xs text-muted-foreground">Optional onboarding token for assisted setup workflows.</p>
+        <div className="h-9 rounded bg-muted/40 border border-border px-3 flex items-center justify-between">
+          <span className="font-mono text-xs text-foreground truncate">{generated || "No token generated yet"}</span>
+          {generated && (
+            <button onClick={() => navigator.clipboard.writeText(generated)} className="text-muted-foreground hover:text-foreground">
+              <Copy className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

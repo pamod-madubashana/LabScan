@@ -15,7 +15,7 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -31,6 +31,7 @@ hex = "0.4"
 rustls = "0.23"
 rustls-pemfile = "2"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+futures-util = "0.3"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

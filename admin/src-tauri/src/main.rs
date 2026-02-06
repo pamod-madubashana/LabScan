@@ -1,36 +1,27 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod server;
-mod database;
-mod discovery;
 mod logger;
+mod server;
 
-use discovery::{DiscoveryService, MDNSService};
-use std::net::{Ipv4Addr, TcpStream};
-
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing_subscriber;
+use tauri::AppHandle;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     tracing::info!("Tauri backend startup");
 
-    let db = Arc::new(Mutex::new(database::init_database()?));
-    let app_state = server::AppState { db };
+    let manager = server::ServerManager::new();
 
     tauri::Builder::default()
-        .setup(|_| {
-            tracing::info!("Tauri app setup complete");
-            Ok(())
-        })
-        .manage(app_state)
+        .manage(manager)
         .invoke_handler(tauri::generate_handler![
             start_server,
             get_server_status,
-            generate_join_token,
+            get_state_snapshot,
+            start_task,
+            update_shared_secret,
+            generate_pair_token,
             logger::log_debug,
             logger::log_info,
             logger::log_warn,
@@ -44,57 +35,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tauri::command]
 async fn start_server(
-    state: tauri::State<'_, server::AppState>,
+    app: AppHandle,
+    state: tauri::State<'_, server::ServerManager>,
     port: Option<u16>,
-) -> Result<String, String> {
-    let port = port.unwrap_or(8443);
-    
-    // Get local IP for discovery
-    let local_ip = get_local_ip().map_err(|e| e.to_string())?;
-    
-    // Start HTTPS server
-    let result = server::start_https_server(state.inner().clone(), port)
-        .await
-        .map_err(|e| e.to_string())?;
-    
-    // Start discovery services
-    tokio::spawn(async move {
-        if let Ok(discovery) = DiscoveryService::new(local_ip, "placeholder-fingerprint".to_string()).await {
-            let _ = discovery.start_beacon("temp-token".to_string()).await;
-        }
-    });
-    
-    // Start mDNS
-    if let Ok(mdns) = MDNSService::new() {
-        let _ = mdns.advertise("LabScan-Admin", port, "placeholder-fingerprint");
-    }
-    
-    Ok(result)
+) -> Result<server::ServerStatus, String> {
+    state.start_server(app, port).await
 }
 
 #[tauri::command]
-async fn get_server_status() -> Result<server::ServerStatus, String> {
-    server::get_status().await.map_err(|e| e.to_string())
-}
-
-fn get_local_ip() -> Result<Ipv4Addr, Box<dyn std::error::Error>> {
-    // Connect to a remote address to determine local IP
-    let stream = TcpStream::connect("8.8.8.8:80")?;
-    let local_addr = stream.local_addr()?;
-    if let std::net::IpAddr::V4(ipv4) = local_addr.ip() {
-        Ok(ipv4)
-    } else {
-        Err("Not IPv4".into())
-    }
+async fn get_server_status(
+    state: tauri::State<'_, server::ServerManager>,
+) -> Result<server::ServerStatus, String> {
+    Ok(state.get_status().await)
 }
 
 #[tauri::command]
-async fn generate_join_token(
-    state: tauri::State<'_, server::AppState>,
-    duration_minutes: Option<u32>,
+async fn get_state_snapshot(
+    state: tauri::State<'_, server::ServerManager>,
+) -> Result<server::StateSnapshot, String> {
+    Ok(state.get_snapshot().await)
+}
+
+#[tauri::command]
+async fn start_task(
+    app: AppHandle,
+    state: tauri::State<'_, server::ServerManager>,
+    kind: String,
+    agent_ids: Vec<String>,
+    params: serde_json::Value,
+) -> Result<server::TaskRecord, String> {
+    state.create_task(app, kind, agent_ids, params).await
+}
+
+#[tauri::command]
+async fn update_shared_secret(
+    app: AppHandle,
+    state: tauri::State<'_, server::ServerManager>,
+    secret: String,
+) -> Result<(), String> {
+    state.update_shared_secret(app, secret).await
+}
+
+#[tauri::command]
+async fn generate_pair_token(
+    state: tauri::State<'_, server::ServerManager>,
 ) -> Result<String, String> {
-    let duration = duration_minutes.unwrap_or(10);
-    server::generate_token(state.inner().clone(), duration)
-        .await
-        .map_err(|e| e.to_string())
+    Ok(state.generate_pair_token().await)
 }
