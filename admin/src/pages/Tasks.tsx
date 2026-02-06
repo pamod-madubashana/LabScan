@@ -32,6 +32,9 @@ const Tasks = () => {
       </div>
 
       <div className="space-y-2">
+        {state.tasks.length === 0 && (
+          <div className="glass-panel p-6 text-center text-xs font-mono text-muted-foreground">No tasks dispatched yet.</div>
+        )}
         {state.tasks.map((task) => {
           const cfg = statusStyle[task.status];
           const StatusIcon = cfg.icon;

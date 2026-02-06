@@ -1,24 +1,20 @@
-import { useState } from "react";
-import { Copy, RefreshCw, Save } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Copy, RefreshCw } from "lucide-react";
 import { useLabScan } from "@/lib/labscan";
 
 const Settings = () => {
-  const { state, updateSharedSecret, generatePairToken } = useLabScan();
-  const [secret, setSecret] = useState(state.settings.shared_secret);
+  const { state, getPairToken, rotatePairToken } = useLabScan();
   const [generated, setGenerated] = useState("");
-  const [saving, setSaving] = useState(false);
 
-  const saveSecret = async () => {
-    setSaving(true);
-    try {
-      await updateSharedSecret(secret.trim());
-    } finally {
-      setSaving(false);
-    }
-  };
+  useEffect(() => {
+    void (async () => {
+      const token = await getPairToken();
+      setGenerated(token);
+    })();
+  }, [getPairToken]);
 
   const createToken = async () => {
-    const token = await generatePairToken();
+    const token = await rotatePairToken();
     setGenerated(token);
   };
 
@@ -32,29 +28,9 @@ const Settings = () => {
       <div className="glass-panel p-4 space-y-3">
         <h3 className="text-sm font-medium">Server</h3>
         <p className="text-xs text-muted-foreground font-mono">
-          Listening on {state.server.bind_addr}:{state.server.port}
+          WebSocket on 0.0.0.0:{state.server.port_ws}
         </p>
-        <p className="text-xs text-muted-foreground">Use Windows Firewall inbound allow rule for TCP {state.server.port}.</p>
-      </div>
-
-      <div className="glass-panel p-4 space-y-3">
-        <h3 className="text-sm font-medium">Shared Secret</h3>
-        <p className="text-xs text-muted-foreground">Agents must provide this secret in the register message.</p>
-        <div className="flex items-center gap-2">
-          <input
-            value={secret}
-            onChange={(event) => setSecret(event.target.value)}
-            className="flex-1 h-9 rounded bg-muted/50 border border-border px-3 text-sm"
-            placeholder="shared secret"
-          />
-          <button
-            onClick={saveSecret}
-            disabled={saving}
-            className="h-9 px-3 rounded-md bg-primary/10 border border-primary/20 text-primary text-xs inline-flex items-center gap-1"
-          >
-            <Save className="w-3.5 h-3.5" /> {saving ? "Saving" : "Save"}
-          </button>
-        </div>
+        <p className="text-xs text-muted-foreground font-mono">Provisioning broadcast UDP {state.server.port_udp}</p>
       </div>
 
       <div className="glass-panel p-4 space-y-3">

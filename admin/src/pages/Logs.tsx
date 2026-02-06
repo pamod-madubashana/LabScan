@@ -73,6 +73,7 @@ const Logs = () => {
       </div>
 
       <div className="glass-panel flex-1 overflow-auto custom-scrollbar p-3 font-mono text-[11px]">
+        {logs.length === 0 && <div className="text-xs text-muted-foreground">No log events yet.</div>}
         {logs.map((entry) => (
           <div key={entry.id} className="grid grid-cols-[180px_60px_180px_1fr] gap-3 py-1 border-b border-border/10">
             <span className="text-muted-foreground">{new Date(entry.ts).toLocaleString()}</span>

@@ -1,4 +1,12 @@
-# LabScan
+<div align="center">
+  <img src="admin\src-tauri\icons\icon.png" width="200" alt="LabScan Logo">
+  
+  # LabScan
+  
+  *A local network monitoring and management system built for controlled environments like labs, classrooms, and small offices.*
+  
+  ---
+</div>
 
 LabScan is a LAN monitoring prototype with:
 

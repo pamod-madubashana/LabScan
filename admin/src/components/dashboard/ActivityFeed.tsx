@@ -1,39 +1,21 @@
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
+import { formatSince, useLabScan } from "@/lib/labscan";
 
-interface ActivityItem {
-  id: string;
-  time: string;
-  message: string;
-  type: "info" | "warning" | "error" | "success";
-}
-
-const typeColors = {
-  info: "text-cyan",
-  warning: "text-amber",
-  error: "text-red",
-  success: "text-green",
-};
-
-const typeDots = {
+const typeDots: Record<string, string> = {
   info: "bg-cyan",
   warning: "bg-amber",
   error: "bg-red",
   success: "bg-green",
 };
 
-const activities: ActivityItem[] = [
-  { id: "1", time: "14:32:18", message: "Network scan completed — 24 hosts discovered", type: "success" },
-  { id: "2", time: "14:31:05", message: "Agent ws-node-07 reconnected after timeout", type: "warning" },
-  { id: "3", time: "14:28:44", message: "Port scan initiated on subnet 10.0.2.0/24", type: "info" },
-  { id: "4", time: "14:25:12", message: "Alert: Unauthorized SSH attempt on db-prod-01", type: "error" },
-  { id: "5", time: "14:22:33", message: "Agent lin-srv-03 heartbeat restored", type: "success" },
-  { id: "6", time: "14:20:01", message: "Scheduled vulnerability scan queued for 3 targets", type: "info" },
-  { id: "7", time: "14:18:47", message: "Certificate expiry warning: proxy-gw.internal (7 days)", type: "warning" },
-  { id: "8", time: "14:15:22", message: "Firewall rule change detected on edge-fw-01", type: "warning" },
-];
-
 export function ActivityFeed() {
+  const { state } = useLabScan();
+  const activities = state.logs.slice(0, 30).map((entry) => {
+    const type = entry.level === "ERROR" ? "error" : entry.level === "WARN" ? "warning" : "info";
+    return { id: entry.id, time: formatSince(entry.ts), message: entry.message, type };
+  });
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }}
@@ -45,6 +27,7 @@ export function ActivityFeed() {
         Recent Activity
       </h3>
       <div className="space-y-0 custom-scrollbar overflow-y-auto max-h-[340px]">
+        {activities.length === 0 && <p className="text-xs text-muted-foreground">No recent activity</p>}
         {activities.map((item, i) => (
           <motion.div
             key={item.id}

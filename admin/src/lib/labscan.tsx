@@ -2,7 +2,7 @@ import { createContext, type ReactNode, useCallback, useContext, useEffect, useM
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-type DeviceStatus = "online" | "idle" | "scanning" | "unreachable";
+type DeviceStatus = "online" | "idle" | "scanning" | "offline" | "unreachable";
 
 export interface DeviceRecord {
   agent_id: string;
@@ -43,26 +43,16 @@ export interface LogRecord {
   level: string;
   agent_id?: string;
   message: string;
-  context?: Record<string, unknown>;
-}
-
-export interface SettingsRecord {
-  bind_addr: string;
-  port: number;
-  shared_secret: string;
-  heartbeat_timeout_secs: number;
 }
 
 export interface ServerStatus {
-  running: boolean;
-  bind_addr: string;
-  port: number;
-  connected_agents: number;
+  online: boolean;
+  port_ws: number;
+  port_udp: number;
 }
 
 export interface LabStateSnapshot {
   server: ServerStatus;
-  settings: SettingsRecord;
   devices: DeviceRecord[];
   tasks: TaskRecord[];
   logs: LogRecord[];
@@ -73,13 +63,12 @@ interface LabScanContextValue {
   ready: boolean;
   error?: string;
   startTask: (kind: TaskRecord["kind"], agentIds: string[], params?: Record<string, unknown>) => Promise<void>;
-  updateSharedSecret: (secret: string) => Promise<void>;
-  generatePairToken: () => Promise<string>;
+  getPairToken: () => Promise<string>;
+  rotatePairToken: () => Promise<string>;
 }
 
 const defaultState: LabStateSnapshot = {
-  server: { running: false, bind_addr: "0.0.0.0", port: 8148, connected_agents: 0 },
-  settings: { bind_addr: "0.0.0.0", port: 8148, shared_secret: "", heartbeat_timeout_secs: 20 },
+  server: { online: false, port_ws: 8148, port_udp: 8870 },
   devices: [],
   tasks: [],
   logs: [],
@@ -94,74 +83,112 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | undefined>();
 
-  const refresh = useCallback(async () => {
-    if (!isTauri()) {
-      setReady(true);
-      return;
-    }
-
-    const snapshot = await invoke<LabStateSnapshot>("get_state_snapshot");
-    setState(snapshot);
-  }, []);
-
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let unsubscribers: Array<() => void> = [];
 
     void (async () => {
       try {
-        if (isTauri()) {
-          await invoke("start_server", { port: null });
-          await refresh();
-          unlisten = await listen<LabStateSnapshot>("labscan://state", (event) => {
-            setState(event.payload);
-          });
+        if (!isTauri()) {
+          setReady(true);
+          return;
         }
+
+        const [server, devicesSnapshot, tasksSnapshot] = await Promise.all([
+          invoke<ServerStatus>("get_server_status"),
+          invoke<{ devices: DeviceRecord[] }>("get_devices_snapshot"),
+          invoke<{ tasks: TaskRecord[] }>("get_tasks_snapshot"),
+        ]);
+
+        setState({
+          server,
+          devices: devicesSnapshot.devices,
+          tasks: tasksSnapshot.tasks,
+          logs: [],
+        });
+
+        const unlistenServer = await listen<ServerStatus>("server_status", (event) => {
+          setState((prev) => ({ ...prev, server: event.payload }));
+        });
+        const unlistenDevices = await listen<{ devices: DeviceRecord[] }>("devices_snapshot", (event) => {
+          setState((prev) => ({ ...prev, devices: event.payload.devices }));
+        });
+        const unlistenDeviceUpsert = await listen<{ device: DeviceRecord }>("device_upsert", (event) => {
+          setState((prev) => {
+            const map = new Map(prev.devices.map((device) => [device.agent_id, device]));
+            map.set(event.payload.device.agent_id, event.payload.device);
+            return { ...prev, devices: Array.from(map.values()) };
+          });
+        });
+        const unlistenDeviceRemove = await listen<{ agent_id: string }>("device_remove", (event) => {
+          setState((prev) => ({
+            ...prev,
+            devices: prev.devices.filter((device) => device.agent_id !== event.payload.agent_id),
+          }));
+        });
+        const unlistenTaskUpdate = await listen<{ task: TaskRecord }>("task_update", (event) => {
+          setState((prev) => {
+            const map = new Map(prev.tasks.map((task) => [task.task_id, task]));
+            map.set(event.payload.task.task_id, event.payload.task);
+            return { ...prev, tasks: Array.from(map.values()) };
+          });
+        });
+        const unlistenLog = await listen<Omit<LogRecord, "id">>("log_event", (event) => {
+          setState((prev) => ({
+            ...prev,
+            logs: [{ ...event.payload, id: `${event.payload.ts}-${event.payload.agent_id ?? "server"}` }, ...prev.logs].slice(0, 400),
+          }));
+        });
+
+        unsubscribers = [
+          unlistenServer,
+          unlistenDevices,
+          unlistenDeviceUpsert,
+          unlistenDeviceRemove,
+          unlistenTaskUpdate,
+          unlistenLog,
+        ];
       } catch (err) {
         setError(err instanceof Error ? err.message : "failed to initialize LabScan runtime");
+        setState(defaultState);
       } finally {
         setReady(true);
       }
     })();
 
     return () => {
-      if (unlisten) {
-        unlisten();
+      for (const dispose of unsubscribers) {
+        dispose();
       }
     };
-  }, [refresh]);
+  }, []);
 
   const startTask = useCallback(
     async (kind: TaskRecord["kind"], agentIds: string[], params: Record<string, unknown> = {}) => {
       if (!isTauri()) {
         return;
       }
-      await invoke("start_task", { kind, agentIds, params });
-      await refresh();
+      await invoke("dispatch_task", { agents: agentIds, kind, params });
     },
-    [refresh],
+    [],
   );
 
-  const updateSharedSecret = useCallback(
-    async (secret: string) => {
-      if (!isTauri()) {
-        return;
-      }
-      await invoke("update_shared_secret", { secret });
-      await refresh();
-    },
-    [refresh],
-  );
-
-  const generatePairToken = useCallback(async () => {
+  const getPairToken = useCallback(async () => {
     if (!isTauri()) {
       return "";
     }
-    return invoke<string>("generate_pair_token");
+    return invoke<string>("get_pair_token");
+  }, []);
+
+  const rotatePairToken = useCallback(async () => {
+    if (!isTauri()) {
+      return "";
+    }
+    return invoke<string>("rotate_pair_token");
   }, []);
 
   const value = useMemo(
-    () => ({ state, ready, error, startTask, updateSharedSecret, generatePairToken }),
-    [state, ready, error, startTask, updateSharedSecret, generatePairToken],
+    () => ({ state, ready, error, startTask, getPairToken, rotatePairToken }),
+    [state, ready, error, startTask, getPairToken, rotatePairToken],
   );
 
   return <LabScanContext.Provider value={value}>{children}</LabScanContext.Provider>;

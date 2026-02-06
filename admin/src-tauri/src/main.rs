@@ -15,13 +15,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tauri::Builder::default()
         .manage(manager)
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            let manager = app.state::<server::ServerManager>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                manager.start_runtime(app_handle).await;
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            start_server,
             get_server_status,
-            get_state_snapshot,
-            start_task,
-            update_shared_secret,
-            generate_pair_token,
+            get_devices_snapshot,
+            get_tasks_snapshot,
+            dispatch_task,
+            get_pair_token,
+            rotate_pair_token,
             logger::log_debug,
             logger::log_info,
             logger::log_warn,
@@ -34,15 +42,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tauri::command]
-async fn start_server(
-    app: AppHandle,
-    state: tauri::State<'_, server::ServerManager>,
-    port: Option<u16>,
-) -> Result<server::ServerStatus, String> {
-    state.start_server(app, port).await
-}
-
-#[tauri::command]
 async fn get_server_status(
     state: tauri::State<'_, server::ServerManager>,
 ) -> Result<server::ServerStatus, String> {
@@ -50,35 +49,41 @@ async fn get_server_status(
 }
 
 #[tauri::command]
-async fn get_state_snapshot(
+async fn get_devices_snapshot(
     state: tauri::State<'_, server::ServerManager>,
-) -> Result<server::StateSnapshot, String> {
-    Ok(state.get_snapshot().await)
+) -> Result<server::DevicesSnapshot, String> {
+    Ok(state.get_devices_snapshot().await)
 }
 
 #[tauri::command]
-async fn start_task(
+async fn get_tasks_snapshot(
+    state: tauri::State<'_, server::ServerManager>,
+) -> Result<server::TasksSnapshot, String> {
+    Ok(state.get_tasks_snapshot().await)
+}
+
+#[tauri::command]
+async fn dispatch_task(
     app: AppHandle,
     state: tauri::State<'_, server::ServerManager>,
+    agents: Vec<String>,
     kind: String,
-    agent_ids: Vec<String>,
     params: serde_json::Value,
 ) -> Result<server::TaskRecord, String> {
-    state.create_task(app, kind, agent_ids, params).await
+    state.dispatch_task(app, agents, kind, params).await
 }
 
 #[tauri::command]
-async fn update_shared_secret(
-    app: AppHandle,
-    state: tauri::State<'_, server::ServerManager>,
-    secret: String,
-) -> Result<(), String> {
-    state.update_shared_secret(app, secret).await
-}
-
-#[tauri::command]
-async fn generate_pair_token(
+async fn get_pair_token(
     state: tauri::State<'_, server::ServerManager>,
 ) -> Result<String, String> {
-    Ok(state.generate_pair_token().await)
+    Ok(state.get_pair_token().await)
+}
+
+#[tauri::command]
+async fn rotate_pair_token(
+    app: AppHandle,
+    state: tauri::State<'_, server::ServerManager>,
+) -> Result<String, String> {
+    state.rotate_pair_token(app).await
 }

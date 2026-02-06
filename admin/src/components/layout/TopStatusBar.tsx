@@ -16,15 +16,15 @@ export function TopStatusBar() {
             <div className="flex items-center gap-2 text-xs">
               <Server className="w-3.5 h-3.5 text-muted-foreground" />
               <div className="flex items-center gap-1.5">
-                <span className={`w-2 h-2 rounded-full ${state.server.running ? "bg-green pulse-dot" : "bg-amber"}`} />
-                <span className={`font-medium font-mono ${state.server.running ? "text-green" : "text-amber"}`}>
-                  {state.server.running ? "ONLINE" : ready ? "OFFLINE" : "STARTING"}
+                <span className={`w-2 h-2 rounded-full ${state.server.online ? "bg-green pulse-dot" : "bg-amber"}`} />
+                <span className={`font-medium font-mono ${state.server.online ? "text-green" : "text-amber"}`}>
+                  {state.server.online ? "ONLINE" : ready ? "OFFLINE" : "STARTING"}
                 </span>
               </div>
             </div>
           </TooltipTrigger>
           <TooltipContent className="bg-card border-border text-foreground">
-            Server {state.server.running ? "online" : "offline"} on {state.server.bind_addr}:{state.server.port}
+            Server {state.server.online ? "online" : "offline"} on ws:{state.server.port_ws} udp:{state.server.port_udp}
           </TooltipContent>
         </Tooltip>
 
@@ -41,7 +41,7 @@ export function TopStatusBar() {
             </div>
           </TooltipTrigger>
           <TooltipContent className="bg-card border-border text-foreground">
-            {state.server.connected_agents} currently connected websocket sessions
+            {state.devices.filter((device) => device.connected).length} currently connected websocket sessions
           </TooltipContent>
         </Tooltip>
 

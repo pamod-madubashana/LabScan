@@ -97,7 +97,17 @@ const Devices = () => {
       </div>
 
       <div className="glass-panel overflow-hidden flex-1">
-        <table className="w-full">
+        {state.devices.length === 0 ? (
+          <div className="h-full min-h-[240px] grid place-items-center text-center p-6">
+            <div>
+              <p className="text-sm text-foreground">No devices connected</p>
+              <p className="text-xs text-muted-foreground font-mono mt-1">
+                {state.server.online ? "Waiting for agents to provision and register." : "Server offline."}
+              </p>
+            </div>
+          </div>
+        ) : (
+          <table className="w-full">
           <thead>
             <tr className="border-b border-border/50">
               <th className="px-3 py-2 text-left text-[10px] font-mono text-muted-foreground">SEL</th>
@@ -145,6 +155,7 @@ const Devices = () => {
             ))}
           </tbody>
         </table>
+        )}
       </div>
 
       <div className="text-xs text-muted-foreground font-mono flex items-center gap-2">
