@@ -1,6 +1,6 @@
 <div align="center">
   <h1>LabScan</h1>
-  <img src="admin/src-tauri/icons/icon.png" alt="LabScan network topology" width="360" />
+  <img src="admin/src-tauri/icons/icon.png" alt="LabScan network topology" width="200" />
   <p>Zero-config LAN monitoring with a Tauri admin dashboard and lightweight Go client agents.</p>
 </div>
 
