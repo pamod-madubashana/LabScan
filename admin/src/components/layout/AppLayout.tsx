@@ -8,7 +8,7 @@ export function AppLayout() {
       <Sidebar />
       <div className="flex flex-col flex-1 min-w-0">
         <TopStatusBar />
-        <main className="flex-1 overflow-auto custom-scrollbar grid-bg">
+        <main className="flex-1 overflow-y-auto overflow-x-hidden custom-scrollbar grid-bg min-w-0">
           <Outlet />
         </main>
       </div>

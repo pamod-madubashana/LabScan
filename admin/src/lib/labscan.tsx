@@ -77,6 +77,8 @@ interface LabScanContextValue {
   state: LabStateSnapshot;
   ready: boolean;
   error?: string;
+  focusedAgentId?: string;
+  setFocusedAgentId: (agentId?: string) => void;
   startTask: (kind: TaskRecord["kind"], agentIds: string[], params?: Record<string, unknown>) => Promise<void>;
   getPairToken: () => Promise<string>;
   rotatePairToken: () => Promise<string>;
@@ -95,31 +97,85 @@ const LabScanContext = createContext<LabScanContextValue | null>(null);
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 function mergeStableDeviceList(current: DeviceRecord[], incoming: DeviceRecord[]): DeviceRecord[] {
-  const byId = new Map(incoming.map((item) => [item.agent_id, item]));
-  const next: DeviceRecord[] = [];
+  const incomingById = new Map(incoming.map((item) => [item.agent_id, item]));
+  const currentById = new Map(current.map((item) => [item.agent_id, item]));
 
-  for (const existing of current) {
-    const updated = byId.get(existing.agent_id);
-    if (updated) {
-      next.push(updated);
-      byId.delete(existing.agent_id);
+  const currentIds = new Set(currentById.keys());
+  const incomingIds = new Set(incomingById.keys());
+
+  let topologyChanged = currentIds.size !== incomingIds.size;
+  if (!topologyChanged) {
+    for (const id of incomingIds) {
+      if (!currentIds.has(id)) {
+        topologyChanged = true;
+        break;
+      }
     }
   }
 
-  const newEntries = Array.from(byId.values()).sort((a, b) => {
-    if (a.first_seen_ms !== b.first_seen_ms) {
-      return a.first_seen_ms - b.first_seen_ms;
+  let ipChanged = false;
+  if (!topologyChanged) {
+    for (const [id, next] of incomingById) {
+      const currentItem = currentById.get(id);
+      if (!currentItem || primaryIpKey(currentItem) !== primaryIpKey(next)) {
+        ipChanged = true;
+        break;
+      }
     }
-    return a.hostname.localeCompare(b.hostname);
-  });
+  }
 
-  return [...next, ...newEntries];
+  if (!topologyChanged && !ipChanged) {
+    return current.map((item) => incomingById.get(item.agent_id) ?? item);
+  }
+
+  return [...incoming].sort(compareDevicesByIp);
+}
+
+function ipToSortableNumber(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+
+  const nums = parts.map((part) => Number(part));
+  if (nums.some((part) => Number.isNaN(part) || part < 0 || part > 255)) {
+    return null;
+  }
+
+  return (((nums[0] << 24) >>> 0) + (nums[1] << 16) + (nums[2] << 8) + nums[3]) >>> 0;
+}
+
+function primaryIpValue(device: DeviceRecord): number | null {
+  const candidates = device.ips
+    .map((ip) => ipToSortableNumber(ip))
+    .filter((value): value is number => value !== null)
+    .sort((a, b) => a - b);
+  return candidates.length > 0 ? candidates[0] : null;
+}
+
+function primaryIpKey(device: DeviceRecord): string {
+  const value = primaryIpValue(device);
+  return value === null ? "none" : String(value);
+}
+
+function compareDevicesByIp(a: DeviceRecord, b: DeviceRecord): number {
+  const aIp = primaryIpValue(a);
+  const bIp = primaryIpValue(b);
+
+  if (aIp === null && bIp !== null) return 1;
+  if (aIp !== null && bIp === null) return -1;
+  if (aIp !== null && bIp !== null && aIp !== bIp) return aIp - bIp;
+
+  const hostCmp = a.hostname.localeCompare(b.hostname);
+  if (hostCmp !== 0) return hostCmp;
+  return a.agent_id.localeCompare(b.agent_id);
 }
 
 export function LabScanProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<LabStateSnapshot>(defaultState);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | undefined>();
+  const [focusedAgentId, setFocusedAgentId] = useState<string | undefined>();
 
   useEffect(() => {
     let unsubscribers: Array<() => void> = [];
@@ -159,7 +215,14 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
         const unlistenDeviceUpsert = await listen<{ device: DeviceRecord }>("device_upsert", (event) => {
           setState((prev) => ({
             ...prev,
-            devices: mergeStableDeviceList(prev.devices, [event.payload.device, ...prev.devices]),
+            devices: mergeStableDeviceList(
+              prev.devices,
+              prev.devices.some((device) => device.agent_id === event.payload.device.agent_id)
+                ? prev.devices.map((device) =>
+                    device.agent_id === event.payload.device.agent_id ? event.payload.device : device,
+                  )
+                : [...prev.devices, event.payload.device],
+            ),
           }));
         });
 
@@ -251,8 +314,8 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ state, ready, error, startTask, getPairToken, rotatePairToken }),
-    [state, ready, error, startTask, getPairToken, rotatePairToken],
+    () => ({ state, ready, error, focusedAgentId, setFocusedAgentId, startTask, getPairToken, rotatePairToken }),
+    [state, ready, error, focusedAgentId, startTask, getPairToken, rotatePairToken],
   );
 
   return <LabScanContext.Provider value={value}>{children}</LabScanContext.Provider>;

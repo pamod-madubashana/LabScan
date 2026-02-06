@@ -1,4 +1,4 @@
-import { Activity, Clock, Server, User, Wifi } from "lucide-react";
+import { Activity, Clock, Server, Wifi } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatSince, useLabScan } from "@/lib/labscan";
 
@@ -69,13 +69,15 @@ export function TopStatusBar() {
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
-        <div className="text-right">
-          <p className="text-xs font-medium text-foreground">admin@labscan.local</p>
-          <p className="text-[10px] text-muted-foreground font-mono">LAN Control</p>
-        </div>
-        <div className="w-7 h-7 rounded-md bg-primary/10 border border-primary/20 flex items-center justify-center">
-          <User className="w-3.5 h-3.5 text-primary" />
+      <div className="flex items-center gap-3 min-w-0 pl-3 border-l border-border/40">
+        <div className="text-right leading-tight min-w-0 max-w-[260px]">
+          <p className="text-xs text-foreground">LabScan Admin</p>
+          <a
+            href="mailto:contact@pamod.is-a.dev"
+            className="text-[10px] text-muted-foreground hover:text-foreground hover:underline transition-colors truncate block"
+          >
+            Contact: contact@pamod.is-a.dev
+          </a>
         </div>
       </div>
     </header>

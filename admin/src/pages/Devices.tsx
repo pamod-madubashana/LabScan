@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Monitor, Play, Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -18,7 +18,7 @@ function boolBadge(value: boolean | null) {
 }
 
 const Devices = () => {
-  const { state, startTask } = useLabScan();
+  const { state, focusedAgentId, setFocusedAgentId, startTask } = useLabScan();
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Record<string, boolean>>({});
 
@@ -34,6 +34,14 @@ const Devices = () => {
     .filter(([, isSelected]) => isSelected)
     .map(([agentId]) => agentId);
 
+  useEffect(() => {
+    if (!focusedAgentId) {
+      return;
+    }
+
+    setSelected((prev) => ({ ...prev, [focusedAgentId]: true }));
+  }, [focusedAgentId]);
+
   const runTask = async (kind: "ping" | "port_scan" | "arp_snapshot") => {
     if (selectedAgentIds.length === 0) return;
     const params =
@@ -46,7 +54,14 @@ const Devices = () => {
   };
 
   const renderRow = (device: DeviceRecord) => (
-    <tr key={device.agent_id} className="border-b border-border/20 hover:bg-accent/30 transition-colors">
+    <tr
+      key={device.agent_id}
+      className={cn(
+        "border-b border-border/20 hover:bg-accent/30 transition-colors",
+        focusedAgentId === device.agent_id && "bg-primary/10",
+      )}
+      onClick={() => setFocusedAgentId(device.agent_id)}
+    >
       <td className="px-3 py-2">
         <input
           type="checkbox"
@@ -103,7 +118,7 @@ const Devices = () => {
         </div>
       </div>
 
-      <div className="glass-panel overflow-hidden flex-1">
+      <div className="glass-panel overflow-hidden flex-1 min-w-0">
         {state.devices.length === 0 ? (
           <div className="h-full min-h-[240px] grid place-items-center text-center p-6">
             <div>
@@ -112,7 +127,8 @@ const Devices = () => {
             </div>
           </div>
         ) : (
-          <table className="w-full">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[980px]">
             <thead>
               <tr className="border-b border-border/50">
                 {[
@@ -134,6 +150,7 @@ const Devices = () => {
             </thead>
             <tbody>{filtered.map(renderRow)}</tbody>
           </table>
+          </div>
         )}
       </div>
 
