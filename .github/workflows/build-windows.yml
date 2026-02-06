@@ -52,11 +52,6 @@ jobs:
         run: |
           cd admin
           npm run tauri build
-
-      - name: Build Go Agent
-        run: |
-          cd agent
-          go build -o labscan-agent.exe .
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
@@ -88,3 +83,8 @@ jobs:
           name: agent-windows
           path: agent/labscan-agent.exe
           if-no-files-found: error
+
+      - name: Build Go Agent
+        run: |
+          cd agent
+          go build -o labscan-agent.exe .
