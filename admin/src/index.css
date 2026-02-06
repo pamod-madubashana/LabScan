@@ -171,4 +171,14 @@
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
     @apply bg-white/20;
   }
+
+  /* React Flow edge baseline visibility for LabScan map */
+  .labscan-map .react-flow__edge-path {
+    opacity: 0.5;
+  }
+
+  .labscan-map .react-flow__edge:hover .react-flow__edge-path,
+  .labscan-map .react-flow__edge.selected .react-flow__edge-path {
+    opacity: 0.9;
+  }
 }

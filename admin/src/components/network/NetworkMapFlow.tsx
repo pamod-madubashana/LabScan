@@ -96,16 +96,23 @@ export function NetworkMapFlow() {
 
   const edges: Edge[] = useMemo(() => {
     return sortedDevices.map((device) => {
-      const highlighted = hoveredId === device.agent_id || focusedAgentId === device.agent_id;
+      const hasHover = Boolean(hoveredId);
+      const isConnectedToHover = hoveredId === device.agent_id;
+      const highlighted = isConnectedToHover || focusedAgentId === device.agent_id;
+
+      const strokeOpacity = hasHover ? (isConnectedToHover ? 0.9 : 0.28) : 0.5;
+      const strokeWidth = hasHover ? (isConnectedToHover ? 3 : 1.8) : 2.1;
+
       return {
         id: `admin-${device.agent_id}`,
         source: "admin",
         target: device.agent_id,
         type: "smoothstep",
+        animated: false,
         style: {
           stroke: highlighted ? "#38bdf8" : "#334155",
-          strokeOpacity: highlighted ? 0.95 : 0.45,
-          strokeWidth: highlighted ? 2 : 1.2,
+          strokeOpacity,
+          strokeWidth,
         },
       };
     });
@@ -128,7 +135,7 @@ export function NetworkMapFlow() {
         zoomOnScroll
         minZoom={0.5}
         maxZoom={1.6}
-        className="bg-transparent"
+        className="bg-transparent labscan-map"
       >
         <Background variant={1} gap={24} size={1.1} color="rgba(148,163,184,0.20)" />
         <MiniMap
