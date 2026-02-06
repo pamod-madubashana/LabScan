@@ -18,7 +18,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, UdpSocket},
     sync::{mpsc, Mutex},
     time::sleep,
 };
@@ -27,6 +27,29 @@ use uuid::Uuid;
 const STATE_EVENT: &str = "labscan://state";
 const MAX_LOGS: usize = 400;
 const EMIT_DEBOUNCE_MS: i64 = 250;
+const WS_PORT: u16 = 8148;
+const PROVISION_UDP_PORT: u16 = 8870;
+
+#[derive(Debug, Clone, Serialize)]
+struct ProvisionBroadcast {
+    #[serde(rename = "type")]
+    message_type: String,
+    v: u8,
+    admin_ip: String,
+    secret: String,
+    nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionAck {
+    #[serde(rename = "type")]
+    message_type: String,
+    v: u8,
+    agent_id: String,
+    hostname: String,
+    nonce: String,
+    ts: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireMessage {
@@ -178,7 +201,7 @@ impl ServerManager {
             inner: Arc::new(Mutex::new(RuntimeState {
                 settings: SettingsRecord {
                     bind_addr: "0.0.0.0".to_string(),
-                    port: 8787,
+                    port: WS_PORT,
                     shared_secret: "labscan-dev-secret".to_string(),
                     heartbeat_timeout_secs: 20,
                 },
@@ -197,13 +220,11 @@ impl ServerManager {
     pub async fn start_server(
         &self,
         app: AppHandle,
-        requested_port: Option<u16>,
+        _requested_port: Option<u16>,
     ) -> Result<ServerStatus, String> {
         let (bind_addr, port, already_running) = {
             let mut state = self.inner.lock().await;
-            if let Some(port) = requested_port {
-                state.settings.port = port;
-            }
+            state.settings.port = WS_PORT;
 
             let status = (
                 state.settings.bind_addr.clone(),
@@ -262,6 +283,17 @@ impl ServerManager {
         let app_for_watchdog = app.clone();
         tokio::spawn(async move {
             watchdog.heartbeat_watchdog(app_for_watchdog).await;
+        });
+
+        let provision_broadcast = self.clone();
+        tokio::spawn(async move {
+            provision_broadcast.run_provision_broadcast().await;
+        });
+
+        let ack_listener = self.clone();
+        let app_for_ack = app.clone();
+        tokio::spawn(async move {
+            ack_listener.run_provision_ack_listener(app_for_ack).await;
         });
 
         self.schedule_state_emit(app).await;
@@ -453,6 +485,99 @@ impl ServerManager {
         }
     }
 
+    async fn run_provision_broadcast(&self) {
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => socket,
+            Err(err) => {
+                tracing::error!("failed to bind UDP broadcast socket: {}", err);
+                return;
+            }
+        };
+
+        if let Err(err) = socket.set_broadcast(true) {
+            tracing::error!("failed to enable UDP broadcast: {}", err);
+            return;
+        }
+
+        let admin_ip = detect_local_ipv4()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let destination = format!("255.255.255.255:{}", PROVISION_UDP_PORT);
+
+        self.append_log(
+            "INFO",
+            None,
+            format!(
+                "Provision broadcast active on UDP {} for ws://{}:{}/ws/agent",
+                PROVISION_UDP_PORT, admin_ip, WS_PORT
+            ),
+            None,
+        )
+        .await;
+
+        loop {
+            let secret = {
+                let state = self.inner.lock().await;
+                if !state.running {
+                    break;
+                }
+                state.settings.shared_secret.clone()
+            };
+
+            let payload = ProvisionBroadcast {
+                message_type: "LABSCAN_PROVISION".to_string(),
+                v: 1,
+                admin_ip: admin_ip.clone(),
+                secret,
+                nonce: Uuid::new_v4().to_string(),
+            };
+
+            if let Ok(raw) = serde_json::to_vec(&payload) {
+                let _ = socket.send_to(&raw, &destination).await;
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn run_provision_ack_listener(&self, app: AppHandle) {
+        let bind_addr = format!("0.0.0.0:{}", PROVISION_UDP_PORT);
+        let socket = match UdpSocket::bind(&bind_addr).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                tracing::warn!("could not bind UDP ack listener on {}: {}", bind_addr, err);
+                return;
+            }
+        };
+
+        let mut buffer = [0_u8; 2048];
+        loop {
+            let (len, sender) = match socket.recv_from(&mut buffer).await {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let payload = &buffer[..len];
+            let ack = match serde_json::from_slice::<ProvisionAck>(payload) {
+                Ok(ack) => ack,
+                Err(_) => continue,
+            };
+
+            if ack.message_type != "LABSCAN_PROVISION_ACK" || ack.v != 1 {
+                continue;
+            }
+
+            self.append_log(
+                "INFO",
+                Some(ack.agent_id.clone()),
+                format!("Provision ACK from {} ({})", ack.hostname, sender),
+                Some(json!({ "nonce": ack.nonce, "ts": ack.ts })),
+            )
+            .await;
+            self.schedule_state_emit(app.clone()).await;
+        }
+    }
+
     async fn append_log(
         &self,
         level: &str,
@@ -535,6 +660,15 @@ impl ServerManager {
         )
         .await;
         self.schedule_state_emit(app).await;
+    }
+}
+
+fn detect_local_ipv4() -> Option<std::net::Ipv4Addr> {
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    udp.connect("8.8.8.8:80").ok()?;
+    match udp.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        _ => None,
     }
 }
 

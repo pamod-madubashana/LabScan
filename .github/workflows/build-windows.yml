@@ -60,13 +60,13 @@ jobs:
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
-          name: windows-executable
+          name: LabScan-Admin
           path: admin/src-tauri/target/release/*.exe
           if-no-files-found: warn
 
       - name: Upload Agent Executable
         uses: actions/upload-artifact@v4
         with:
-          name: agent-windows
+          name: LabScan-Agent
           path: agent/labscan-agent.exe
           if-no-files-found: error

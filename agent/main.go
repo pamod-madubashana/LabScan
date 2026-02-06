@@ -21,18 +21,35 @@ import (
 )
 
 const (
-	defaultAdminURL = "ws://127.0.0.1:8787/ws/agent"
-	defaultSecret   = "labscan-dev-secret"
-	agentVersion    = "0.2.0"
+	provisionUDPPort = 8870
+	wsPort           = 8148
+	configPath       = "agent_config.json"
+	agentVersion     = "0.3.0"
+	defaultFakeCount = 4
 )
 
-type Config struct {
-	AdminURL           string `json:"admin_url"`
-	AgentID            string `json:"agent_id"`
-	Secret             string `json:"secret"`
-	HeartbeatIntervalS int    `json:"heartbeat_interval_s"`
-	ReconnectMinMS     int    `json:"reconnect_min_ms"`
-	ReconnectMaxMS     int    `json:"reconnect_max_ms"`
+type PersistedConfig struct {
+	AgentID       string `json:"agent_id"`
+	AdminIP       string `json:"admin_ip"`
+	Secret        string `json:"secret"`
+	ProvisionedAt int64  `json:"provisioned_at"`
+}
+
+type ProvisionMessage struct {
+	Type    string `json:"type"`
+	V       int    `json:"v"`
+	AdminIP string `json:"admin_ip"`
+	Secret  string `json:"secret"`
+	Nonce   string `json:"nonce"`
+}
+
+type ProvisionAck struct {
+	Type    string `json:"type"`
+	V       int    `json:"v"`
+	AgentID string `json:"agent_id"`
+	Host    string `json:"hostname"`
+	Nonce   string `json:"nonce"`
+	TS      int64  `json:"ts"`
 }
 
 type WireMessage struct {
@@ -72,48 +89,193 @@ type TaskResultPayload struct {
 }
 
 type RegisteredResponse struct {
-	OK          bool                   `json:"ok"`
-	Error       string                 `json:"error,omitempty"`
-	ServerTime  int64                  `json:"server_time"`
-	AgentConfig map[string]interface{} `json:"agent_config,omitempty"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+type AgentProfile struct {
+	AgentID  string
+	Hostname string
+	IPs      []string
+	IsFake   bool
 }
 
 type AgentClient struct {
-	config  *Config
-	conn    *websocket.Conn
-	writeMu sync.Mutex
+	profile   AgentProfile
+	adminIP   string
+	secret    string
+	heartbeat time.Duration
+	conn      *websocket.Conn
+	writeMu   sync.Mutex
 }
 
 func main() {
-	configPath := flag.String("config", "config.json", "Path to config file")
-	adminURL := flag.String("admin-url", "", "Admin websocket URL")
-	secret := flag.String("secret", "", "Shared secret")
+	fake := flag.Bool("fake", false, "Run in fake provisioning mode")
+	fakeCount := flag.Int("fake-count", defaultFakeCount, "Number of fake agents")
 	flag.Parse()
 
-	config, err := loadOrCreateConfig(*configPath, *adminURL, *secret)
-	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+	if *fakeCount <= 0 {
+		*fakeCount = defaultFakeCount
 	}
 
-	client := &AgentClient{config: config}
-	client.runForever()
+	if *fake {
+		runFakeMode(*fakeCount)
+		return
+	}
+
+	runNormalMode()
 }
 
-func (c *AgentClient) runForever() {
-	backoff := time.Duration(c.config.ReconnectMinMS) * time.Millisecond
-	maxBackoff := time.Duration(c.config.ReconnectMaxMS) * time.Millisecond
+func runNormalMode() {
+	hostname, _ := os.Hostname()
+	agentID := stableAgentID("")
+
+	if cfg, err := loadConfig(); err == nil && cfg.AdminIP != "" && cfg.Secret != "" {
+		cfg.AgentID = stableAgentID(cfg.AgentID)
+		profile := AgentProfile{AgentID: cfg.AgentID, Hostname: hostname, IPs: localIPv4s(), IsFake: false}
+		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, 8*time.Second)
+		if err := client.runWithFallbackThreshold(5); err == nil {
+			return
+		}
+		log.Printf("Saved config failed, returning to sleep mode")
+	}
 
 	for {
-		err := c.runSession()
+		cfg, err := waitForProvision(agentID, hostname)
 		if err != nil {
-			log.Printf("session ended: %v", err)
+			log.Printf("provisioning listener error: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
-		jitter := time.Duration(rand.Intn(350)) * time.Millisecond
-		sleepFor := backoff + jitter
-		log.Printf("reconnecting in %s", sleepFor)
-		time.Sleep(sleepFor)
+		profile := AgentProfile{AgentID: cfg.AgentID, Hostname: hostname, IPs: localIPv4s(), IsFake: false}
+		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, 8*time.Second)
+		if err := client.runWithFallbackThreshold(5); err != nil {
+			log.Printf("connection dropped after repeated failures: %v", err)
+		}
+	}
+}
 
+func runFakeMode(fakeCount int) {
+	hostname, _ := os.Hostname()
+	controllerID := stableAgentID("")
+	cfg, err := waitForProvision(controllerID, hostname)
+	if err != nil {
+		log.Fatalf("failed provisioning in fake mode: %v", err)
+	}
+
+	for i := 1; i <= fakeCount; i++ {
+		profile := AgentProfile{
+			AgentID:  uuid.NewString(),
+			Hostname: fmt.Sprintf("LABSCAN-FAKE-%03d", i),
+			IPs:      []string{fmt.Sprintf("192.168.1.%d", 100+i)},
+			IsFake:   true,
+		}
+
+		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, jitterDuration(5, 10))
+		go func(c *AgentClient) {
+			_ = c.runWithFallbackThreshold(1000000)
+		}(client)
+	}
+
+	log.Printf("Fake mode: spawned %d agents", fakeCount)
+	select {}
+}
+
+func waitForProvision(agentID, hostname string) (*PersistedConfig, error) {
+	listenAddr := fmt.Sprintf(":%d", provisionUDPPort)
+	conn, err := net.ListenPacket("udp4", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	log.Printf("Sleep mode: waiting for admin provisioning on UDP %d...", provisionUDPPort)
+
+	buffer := make([]byte, 4096)
+	for {
+		n, sender, err := conn.ReadFrom(buffer)
+		if err != nil {
+			return nil, err
+		}
+
+		senderUDP, ok := sender.(*net.UDPAddr)
+		if !ok || !isPrivateIP(senderUDP.IP) {
+			continue
+		}
+
+		var provision ProvisionMessage
+		if err := json.Unmarshal(buffer[:n], &provision); err != nil {
+			continue
+		}
+
+		if provision.Type != "LABSCAN_PROVISION" || provision.V != 1 {
+			continue
+		}
+		if strings.TrimSpace(provision.AdminIP) == "" || strings.TrimSpace(provision.Secret) == "" {
+			continue
+		}
+
+		cfg := &PersistedConfig{
+			AgentID:       stableAgentID(agentID),
+			AdminIP:       provision.AdminIP,
+			Secret:        provision.Secret,
+			ProvisionedAt: nowMS(),
+		}
+
+		if err := saveConfig(cfg); err != nil {
+			log.Printf("warning: failed to persist config: %v", err)
+		}
+
+		ack := ProvisionAck{
+			Type:    "LABSCAN_PROVISION_ACK",
+			V:       1,
+			AgentID: cfg.AgentID,
+			Host:    hostname,
+			Nonce:   provision.Nonce,
+			TS:      nowMS(),
+		}
+		if raw, err := json.Marshal(ack); err == nil {
+			_, _ = conn.WriteTo(raw, sender)
+		}
+
+		log.Printf("Provisioned by %s:%d, connecting...", senderUDP.IP.String(), senderUDP.Port)
+		return cfg, nil
+	}
+}
+
+func newAgentClient(profile AgentProfile, adminIP, secret string, heartbeat time.Duration) *AgentClient {
+	if heartbeat <= 0 {
+		heartbeat = 8 * time.Second
+	}
+	return &AgentClient{profile: profile, adminIP: adminIP, secret: secret, heartbeat: heartbeat}
+}
+
+func (c *AgentClient) runWithFallbackThreshold(maxConsecutiveFailures int) error {
+	if maxConsecutiveFailures < 1 {
+		maxConsecutiveFailures = 1
+	}
+
+	backoff := time.Second
+	maxBackoff := 20 * time.Second
+	consecutiveFailures := 0
+
+	for {
+		registered, err := c.runSession()
+		if err != nil {
+			log.Printf("[%s] session ended: %v", c.profile.Hostname, err)
+		}
+
+		if registered {
+			consecutiveFailures = 0
+		} else {
+			consecutiveFailures++
+			if consecutiveFailures >= maxConsecutiveFailures {
+				return errors.New("too many consecutive connection failures")
+			}
+		}
+
+		time.Sleep(backoff + time.Duration(rand.Intn(400))*time.Millisecond)
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
@@ -121,11 +283,11 @@ func (c *AgentClient) runForever() {
 	}
 }
 
-func (c *AgentClient) runSession() error {
-	log.Printf("connecting to %s", c.config.AdminURL)
-	conn, _, err := websocket.DefaultDialer.Dial(c.config.AdminURL, nil)
+func (c *AgentClient) runSession() (bool, error) {
+	url := fmt.Sprintf("ws://%s:%d/ws/agent", c.adminIP, wsPort)
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
-		return fmt.Errorf("websocket dial failed: %w", err)
+		return false, fmt.Errorf("dial failed: %w", err)
 	}
 	defer conn.Close()
 
@@ -133,32 +295,41 @@ func (c *AgentClient) runSession() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := c.sendRegister(); err != nil {
-		return err
+	if err := c.send("register", RegisterPayload{
+		AgentID:  c.profile.AgentID,
+		Secret:   c.secret,
+		Hostname: c.profile.Hostname,
+		IPs:      c.profile.IPs,
+		OS:       runtime.GOOS,
+		Arch:     runtime.GOARCH,
+		Version:  agentVersion,
+	}); err != nil {
+		return false, err
 	}
 
-	registeredOK := make(chan struct{})
+	registered := make(chan bool, 1)
 	errCh := make(chan error, 1)
-
 	go func() {
-		errCh <- c.readLoop(ctx, registeredOK)
+		errCh <- c.readLoop(ctx, registered)
 	}()
 
 	select {
-	case <-registeredOK:
-		log.Printf("register acknowledged by admin")
+	case ok := <-registered:
+		if !ok {
+			return false, errors.New("registration rejected")
+		}
 	case err := <-errCh:
-		return err
+		return false, err
 	case <-time.After(10 * time.Second):
-		return errors.New("timeout waiting for register response")
+		return false, errors.New("register timeout")
 	}
 
 	go c.heartbeatLoop(ctx)
-	return <-errCh
+	return true, <-errCh
 }
 
-func (c *AgentClient) readLoop(ctx context.Context, registeredOK chan<- struct{}) error {
-	registeredSeen := false
+func (c *AgentClient) readLoop(ctx context.Context, registered chan<- bool) error {
+	registeredSent := false
 
 	for {
 		_, raw, err := c.conn.ReadMessage()
@@ -168,11 +339,8 @@ func (c *AgentClient) readLoop(ctx context.Context, registeredOK chan<- struct{}
 
 		var message struct {
 			Type    string          `json:"type"`
-			TS      int64           `json:"ts"`
-			AgentID string          `json:"agent_id"`
 			Payload json.RawMessage `json:"payload"`
 		}
-
 		if err := json.Unmarshal(raw, &message); err != nil {
 			continue
 		}
@@ -181,25 +349,24 @@ func (c *AgentClient) readLoop(ctx context.Context, registeredOK chan<- struct{}
 		case "registered":
 			var payload RegisteredResponse
 			if err := json.Unmarshal(message.Payload, &payload); err != nil {
-				return fmt.Errorf("invalid registered payload: %w", err)
+				continue
+			}
+			if !registeredSent {
+				registered <- payload.OK
+				registeredSent = true
 			}
 			if !payload.OK {
-				return fmt.Errorf("registration rejected: %s", payload.Error)
-			}
-			if !registeredSeen {
-				registeredSeen = true
-				registeredOK <- struct{}{}
+				return errors.New(payload.Error)
 			}
 
 		case "task":
-			var task TaskPayload
-			if err := json.Unmarshal(message.Payload, &task); err != nil {
+			var payload TaskPayload
+			if err := json.Unmarshal(message.Payload, &payload); err != nil {
 				continue
 			}
-			go c.executeTask(task)
+			go c.executeTask(payload)
 
 		case "task_cancel":
-			// Cancellation can be added with per-task contexts later.
 			continue
 		}
 
@@ -212,15 +379,16 @@ func (c *AgentClient) readLoop(ctx context.Context, registeredOK chan<- struct{}
 }
 
 func (c *AgentClient) heartbeatLoop(ctx context.Context) {
-	interval := time.Duration(c.config.HeartbeatIntervalS) * time.Second
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	for {
+		wait := c.heartbeat
+		if c.profile.IsFake {
+			wait = jitterDuration(5, 10)
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(wait):
 			payload := HeartbeatPayload{
 				Status:   "idle",
 				LastSeen: nowMS(),
@@ -235,100 +403,63 @@ func (c *AgentClient) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-func (c *AgentClient) sendRegister() error {
-	hostname, _ := os.Hostname()
-	payload := RegisterPayload{
-		AgentID:  c.config.AgentID,
-		Secret:   c.config.Secret,
-		Hostname: hostname,
-		IPs:      localIPs(),
-		OS:       runtime.GOOS,
-		Arch:     runtime.GOARCH,
-		Version:  agentVersion,
-	}
-
-	return c.send("register", payload)
-}
-
-func (c *AgentClient) sendLog(level, message string, context map[string]interface{}) {
-	_ = c.send("log", map[string]interface{}{
-		"level":   strings.ToUpper(level),
-		"message": message,
-		"context": context,
-	})
-}
-
-func (c *AgentClient) send(messageType string, payload interface{}) error {
-	if c.conn == nil {
-		return errors.New("connection not available")
-	}
-
-	msg := WireMessage{
-		Type:    messageType,
-		TS:      nowMS(),
-		AgentID: c.config.AgentID,
-		Payload: payload,
-	}
-
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.WriteMessage(websocket.TextMessage, raw)
-}
-
 func (c *AgentClient) executeTask(task TaskPayload) {
-	c.sendLog("INFO", fmt.Sprintf("running task %s (%s)", task.TaskID, task.Kind), map[string]interface{}{"task_id": task.TaskID})
-
-	result, err := runTask(task.Kind, task.Params)
-	response := TaskResultPayload{
-		TaskID: task.TaskID,
-		OK:     err == nil,
-		Result: result,
-	}
-
+	result, err := runTask(c.profile.IsFake, task.Kind, task.Params)
+	response := TaskResultPayload{TaskID: task.TaskID, OK: err == nil, Result: result}
 	if err != nil {
 		errText := err.Error()
 		response.Error = &errText
-		c.sendLog("ERROR", fmt.Sprintf("task %s failed: %v", task.TaskID, err), map[string]interface{}{"task_id": task.TaskID})
-	} else {
-		c.sendLog("INFO", fmt.Sprintf("task %s done", task.TaskID), map[string]interface{}{"task_id": task.TaskID})
 	}
-
 	_ = c.send("task_result", response)
 }
 
-func runTask(kind string, params map[string]interface{}) (interface{}, error) {
+func runTask(fake bool, kind string, params map[string]interface{}) (interface{}, error) {
+	if fake {
+		switch kind {
+		case "ping":
+			return map[string]interface{}{"ok": true, "latency_ms": 5 + rand.Intn(25)}, nil
+		case "port_scan":
+			ports := asIntSlice(params["ports"], []int{22, 80, 443})
+			openPorts := make([]int, 0)
+			for _, p := range ports {
+				if p%2 == 0 || p == 443 {
+					openPorts = append(openPorts, p)
+				}
+			}
+			return map[string]interface{}{"open_ports": openPorts, "scanned": len(ports)}, nil
+		case "arp_snapshot":
+			entries := []string{
+				"192.168.1.1 aa-bb-cc-dd-ee-01 dynamic",
+				"192.168.1.20 aa-bb-cc-dd-ee-14 dynamic",
+				"192.168.1.51 aa-bb-cc-dd-ee-51 dynamic",
+			}
+			return map[string]interface{}{"entries": entries, "count": len(entries)}, nil
+		default:
+			return nil, fmt.Errorf("unsupported task kind: %s", kind)
+		}
+	}
+
 	switch kind {
 	case "ping":
-		return runPing(params)
+		return runRealPing(params)
 	case "port_scan":
-		return runPortScan(params)
+		return runRealPortScan(params)
 	case "arp_snapshot":
-		return runARPSnapshot()
+		return runRealARPSnapshot()
 	default:
 		return nil, fmt.Errorf("unsupported task kind: %s", kind)
 	}
 }
 
-func runPing(params map[string]interface{}) (interface{}, error) {
+func runRealPing(params map[string]interface{}) (interface{}, error) {
 	target := asString(params["target"], "8.8.8.8")
 	timeoutMS := asInt(params["timeout_ms"], 1200)
-	addr := target
-	if !strings.Contains(target, ":") {
-		addr = net.JoinHostPort(target, "80")
-	}
+	addr := net.JoinHostPort(target, "80")
 
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, time.Duration(timeoutMS)*time.Millisecond)
 	if err != nil {
-		return map[string]interface{}{
-			"target": target,
-			"ok":     false,
-		}, nil
+		return map[string]interface{}{"target": target, "ok": false}, nil
 	}
 	_ = conn.Close()
 
@@ -339,10 +470,10 @@ func runPing(params map[string]interface{}) (interface{}, error) {
 	}, nil
 }
 
-func runPortScan(params map[string]interface{}) (interface{}, error) {
+func runRealPortScan(params map[string]interface{}) (interface{}, error) {
 	target := asString(params["target"], "127.0.0.1")
-	timeoutMS := asInt(params["timeout_ms"], 600)
 	ports := asIntSlice(params["ports"], []int{22, 80, 443})
+	timeoutMS := asInt(params["timeout_ms"], 700)
 
 	openPorts := make([]int, 0)
 	for _, port := range ports {
@@ -354,14 +485,10 @@ func runPortScan(params map[string]interface{}) (interface{}, error) {
 		}
 	}
 
-	return map[string]interface{}{
-		"target":     target,
-		"scanned":    len(ports),
-		"open_ports": openPorts,
-	}, nil
+	return map[string]interface{}{"target": target, "open_ports": openPorts, "scanned": len(ports)}, nil
 }
 
-func runARPSnapshot() (interface{}, error) {
+func runRealARPSnapshot() (interface{}, error) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("arp", "-a")
@@ -371,119 +498,145 @@ func runARPSnapshot() (interface{}, error) {
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("failed to capture arp table: %w", err)
+		return nil, fmt.Errorf("arp snapshot failed: %w", err)
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	return map[string]interface{}{
-		"entries": lines,
-		"count":   len(lines),
-	}, nil
+	return map[string]interface{}{"entries": lines, "count": len(lines)}, nil
 }
 
-func loadOrCreateConfig(path, adminURL, secret string) (*Config, error) {
-	config := &Config{}
-
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		config.AdminURL = fallback(adminURL, defaultAdminURL)
-		config.Secret = fallback(secret, defaultSecret)
-		config.AgentID = uuid.New().String()
-		config.HeartbeatIntervalS = 8
-		config.ReconnectMinMS = 1000
-		config.ReconnectMaxMS = 20000
-		return config, saveConfig(path, config)
+func (c *AgentClient) send(messageType string, payload interface{}) error {
+	if c.conn == nil {
+		return errors.New("connection unavailable")
 	}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := json.Unmarshal(data, config); err != nil {
-		return nil, err
-	}
-
-	if config.AgentID == "" {
-		config.AgentID = uuid.New().String()
-	}
-	if config.AdminURL == "" {
-		config.AdminURL = defaultAdminURL
-	}
-	if config.Secret == "" {
-		config.Secret = defaultSecret
-	}
-	if config.HeartbeatIntervalS <= 0 {
-		config.HeartbeatIntervalS = 8
-	}
-	if config.ReconnectMinMS <= 0 {
-		config.ReconnectMinMS = 1000
-	}
-	if config.ReconnectMaxMS < config.ReconnectMinMS {
-		config.ReconnectMaxMS = config.ReconnectMinMS * 4
-	}
-
-	if adminURL != "" {
-		config.AdminURL = adminURL
-	}
-	if secret != "" {
-		config.Secret = secret
-	}
-
-	if err := saveConfig(path, config); err != nil {
-		return nil, err
-	}
-
-	return config, nil
-}
-
-func saveConfig(path string, config *Config) error {
-	data, err := json.MarshalIndent(config, "", "  ")
+	wire := WireMessage{Type: messageType, TS: nowMS(), AgentID: c.profile.AgentID, Payload: payload}
+	raw, err := json.Marshal(wire)
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0o644)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.WriteMessage(websocket.TextMessage, raw)
 }
 
-func localIPs() []string {
-	ifaces, err := net.Interfaces()
+func loadConfig() (*PersistedConfig, error) {
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil
+		return nil, err
+	}
+
+	var cfg PersistedConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	if cfg.AgentID == "" {
+		cfg.AgentID = uuid.NewString()
+	}
+	return &cfg, nil
+}
+
+func saveConfig(cfg *PersistedConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, data, 0o644)
+}
+
+func stableAgentID(existing string) string {
+	if strings.TrimSpace(existing) != "" {
+		return existing
+	}
+	if cfg, err := loadConfig(); err == nil && strings.TrimSpace(cfg.AgentID) != "" {
+		return cfg.AgentID
+	}
+	return uuid.NewString()
+}
+
+func localIPv4s() []string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return []string{}
 	}
 
 	ips := make([]string, 0)
-	for _, iface := range ifaces {
+	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
+
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
+
 		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok || ipNet.IP.IsLoopback() || ipNet.IP.To4() == nil {
+			netAddr, ok := addr.(*net.IPNet)
+			if !ok || netAddr.IP == nil || netAddr.IP.IsLoopback() {
 				continue
 			}
-			ips = append(ips, ipNet.IP.String())
+			if ip4 := netAddr.IP.To4(); ip4 != nil {
+				ips = append(ips, ip4.String())
+			}
 		}
+	}
+
+	if len(ips) == 0 {
+		return []string{"127.0.0.1"}
 	}
 	return ips
 }
 
+func isPrivateIP(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+
+	if ip4[0] == 10 {
+		return true
+	}
+	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+		return true
+	}
+	if ip4[0] == 192 && ip4[1] == 168 {
+		return true
+	}
+	if ip4[0] == 127 {
+		return true
+	}
+	return false
+}
+
+func jitterDuration(minSeconds, maxSeconds int) time.Duration {
+	if minSeconds < 1 {
+		minSeconds = 1
+	}
+	if maxSeconds < minSeconds {
+		maxSeconds = minSeconds
+	}
+	rangeSize := maxSeconds - minSeconds + 1
+	return time.Duration(minSeconds+rand.Intn(rangeSize)) * time.Second
+}
+
 func asString(v interface{}, fallback string) string {
-	if value, ok := v.(string); ok && strings.TrimSpace(value) != "" {
-		return value
+	if s, ok := v.(string); ok {
+		trimmed := strings.TrimSpace(s)
+		if trimmed != "" {
+			return trimmed
+		}
 	}
 	return fallback
 }
 
 func asInt(v interface{}, fallback int) int {
 	switch value := v.(type) {
-	case float64:
-		return int(value)
 	case int:
 		return value
+	case float64:
+		return int(value)
 	default:
 		return fallback
 	}
@@ -496,26 +649,18 @@ func asIntSlice(v interface{}, fallback []int) []int {
 	}
 
 	ports := make([]int, 0, len(values))
-	for _, value := range values {
-		switch typed := value.(type) {
-		case float64:
-			ports = append(ports, int(typed))
+	for _, raw := range values {
+		switch val := raw.(type) {
 		case int:
-			ports = append(ports, typed)
+			ports = append(ports, val)
+		case float64:
+			ports = append(ports, int(val))
 		}
 	}
-
 	if len(ports) == 0 {
 		return fallback
 	}
 	return ports
-}
-
-func fallback(candidate, defaultValue string) string {
-	if strings.TrimSpace(candidate) == "" {
-		return defaultValue
-	}
-	return candidate
 }
 
 func nowMS() int64 {

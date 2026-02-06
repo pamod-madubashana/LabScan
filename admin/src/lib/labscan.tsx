@@ -78,8 +78,8 @@ interface LabScanContextValue {
 }
 
 const defaultState: LabStateSnapshot = {
-  server: { running: false, bind_addr: "0.0.0.0", port: 8787, connected_agents: 0 },
-  settings: { bind_addr: "0.0.0.0", port: 8787, shared_secret: "", heartbeat_timeout_secs: 20 },
+  server: { running: false, bind_addr: "0.0.0.0", port: 8148, connected_agents: 0 },
+  settings: { bind_addr: "0.0.0.0", port: 8148, shared_secret: "", heartbeat_timeout_secs: 20 },
   devices: [],
   tasks: [],
   logs: [],
