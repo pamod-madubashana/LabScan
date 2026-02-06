@@ -8,8 +8,8 @@ import { useLabScan } from "@/lib/labscan";
 const Dashboard = () => {
   const { state } = useLabScan();
 
-  const online = state.devices.filter((device) => device.connected).length;
-  const offline = state.devices.filter((device) => !device.connected).length;
+  const online = state.devices.filter((device) => device.status !== "offline").length;
+  const offline = state.devices.filter((device) => device.status === "offline").length;
   const recentError = state.logs.find((entry) => entry.level === "ERROR");
 
   return (

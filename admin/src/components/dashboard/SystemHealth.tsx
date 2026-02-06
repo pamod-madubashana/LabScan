@@ -4,8 +4,8 @@ import { useLabScan } from "@/lib/labscan";
 export function SystemHealth() {
   const { state } = useLabScan();
 
-  const connected = state.devices.filter((device) => device.connected).length;
-  const offline = state.devices.filter((device) => !device.connected).length;
+  const connected = state.devices.filter((device) => device.status !== "offline").length;
+  const offline = state.devices.filter((device) => device.status === "offline").length;
   const runningTasks = state.tasks.filter((task) => task.status === "running").length;
 
   return (

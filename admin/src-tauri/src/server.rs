@@ -27,8 +27,12 @@ use uuid::Uuid;
 
 const WS_PORT: u16 = 8148;
 const UDP_PORT: u16 = 8870;
-const HEARTBEAT_TIMEOUT_MS: i64 = 25_000;
+const HEARTBEAT_TIMEOUT_MS: i64 = 20_000;
+const DEVICE_EMIT_THROTTLE_MS: i64 = 1_000;
+const DEVICE_ACTIVITY_RATE_MS: i64 = 5_000;
+const ACTIVITY_DEDUPE_MS: i64 = 30_000;
 const MAX_LOGS: usize = 400;
+const MAX_ACTIVITY: usize = 200;
 
 const EVENT_SERVER_STATUS: &str = "server_status";
 const EVENT_DEVICES_SNAPSHOT: &str = "devices_snapshot";
@@ -36,6 +40,7 @@ const EVENT_DEVICE_UPSERT: &str = "device_upsert";
 const EVENT_DEVICE_REMOVE: &str = "device_remove";
 const EVENT_LOG: &str = "log_event";
 const EVENT_TASK_UPDATE: &str = "task_update";
+const EVENT_ACTIVITY: &str = "activity_event";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -50,12 +55,16 @@ pub struct DeviceRecord {
     pub hostname: String,
     pub ips: Vec<String>,
     pub os: String,
-    pub arch: String,
     pub version: String,
     pub status: String,
-    pub last_seen: i64,
-    pub connected: bool,
-    pub last_metrics: Option<Value>,
+    pub last_seen_ms: i64,
+    pub internet_reachable: Option<bool>,
+    pub dns_ok: Option<bool>,
+    pub gateway_reachable: Option<bool>,
+    pub latency_ms: Option<i64>,
+    pub last_internet_change_ms: Option<i64>,
+    pub last_dns_change_ms: Option<i64>,
+    pub first_seen_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +100,23 @@ pub struct TasksSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEvent {
+    pub id: String,
+    pub kind: String,
+    pub agent_id: Option<String>,
+    pub message: String,
+    pub ts: i64,
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivitySnapshot {
+    pub events: Vec<ActivityEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogEvent {
+    pub id: String,
     pub agent_id: Option<String>,
     pub level: String,
     pub message: String,
@@ -150,7 +175,6 @@ struct RegisterPayload {
     hostname: String,
     ips: Vec<String>,
     os: String,
-    arch: String,
     version: String,
 }
 
@@ -181,9 +205,13 @@ struct RuntimeState {
     online: bool,
     pair_token: String,
     devices: HashMap<String, DeviceRecord>,
+    device_order: Vec<String>,
     tasks: HashMap<String, TaskRecord>,
     logs: VecDeque<LogEvent>,
+    activity: VecDeque<ActivityEvent>,
     connections: HashMap<String, mpsc::UnboundedSender<Message>>,
+    last_device_emit_ms: HashMap<String, i64>,
+    last_activity_emit_ms: HashMap<String, i64>,
 }
 
 #[derive(Clone)]
@@ -204,19 +232,20 @@ impl ServerManager {
                 online: false,
                 pair_token: Uuid::new_v4().to_string(),
                 devices: HashMap::new(),
+                device_order: Vec::new(),
                 tasks: HashMap::new(),
                 logs: VecDeque::new(),
+                activity: VecDeque::new(),
                 connections: HashMap::new(),
+                last_device_emit_ms: HashMap::new(),
+                last_activity_emit_ms: HashMap::new(),
             })),
         }
     }
 
     pub async fn start_runtime(&self, app: AppHandle) {
-        let already_online = {
-            let state = self.inner.lock().await;
-            state.online
-        };
-        if already_online {
+        let online = { self.inner.lock().await.online };
+        if online {
             return;
         }
 
@@ -249,11 +278,14 @@ impl ServerManager {
     }
 
     pub async fn get_devices_snapshot(&self) -> DevicesSnapshot {
-        let mut devices = {
+        let devices = {
             let state = self.inner.lock().await;
-            state.devices.values().cloned().collect::<Vec<_>>()
+            state
+                .device_order
+                .iter()
+                .filter_map(|id| state.devices.get(id).cloned())
+                .collect::<Vec<_>>()
         };
-        devices.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         DevicesSnapshot { devices }
     }
 
@@ -266,9 +298,16 @@ impl ServerManager {
         TasksSnapshot { tasks }
     }
 
+    pub async fn get_activity_snapshot(&self) -> ActivitySnapshot {
+        let events = {
+            let state = self.inner.lock().await;
+            state.activity.iter().cloned().collect::<Vec<_>>()
+        };
+        ActivitySnapshot { events }
+    }
+
     pub async fn get_pair_token(&self) -> String {
-        let state = self.inner.lock().await;
-        state.pair_token.clone()
+        self.inner.lock().await.pair_token.clone()
     }
 
     pub async fn rotate_pair_token(&self, app: AppHandle) -> Result<String, String> {
@@ -277,7 +316,6 @@ impl ServerManager {
             state.pair_token = Uuid::new_v4().to_string();
             state.pair_token.clone()
         };
-
         self.emit_server_status(&app).await;
         self.emit_log(&app, None, "INFO", "Pair token rotated".to_string())
             .await;
@@ -311,17 +349,20 @@ impl ServerManager {
         };
 
         {
-            let mut state = self.inner.lock().await;
-            state.tasks.insert(task.task_id.clone(), task.clone());
+            self.inner
+                .lock()
+                .await
+                .tasks
+                .insert(task.task_id.clone(), task.clone());
         }
 
         let updated = self.dispatch_task_now(task).await;
         self.emit_task_update(&app, updated.clone()).await;
-        self.emit_log(
+        self.emit_activity(
             &app,
+            "task_started",
             None,
-            "INFO",
-            format!("Task dispatched: {} ({})", updated.kind, updated.task_id),
+            format!("Task started: {} ({})", updated.kind, updated.task_id),
         )
         .await;
         Ok(updated)
@@ -330,39 +371,24 @@ impl ServerManager {
     async fn run_ws_server(&self, app: AppHandle) {
         let bind_addr = format!("0.0.0.0:{}", WS_PORT);
         tracing::info!("[WS] binding addr={}", bind_addr);
-        self.emit_log(
-            &app,
-            None,
-            "INFO",
-            format!("Starting WS server on {}", bind_addr),
-        )
-        .await;
+        self.emit_log(&app, None, "INFO", format!("Starting WS server on {}", bind_addr))
+            .await;
 
         let listener = match TcpListener::bind(&bind_addr).await {
             Ok(listener) => listener,
             Err(err) => {
-                tracing::error!("[WS] bind failed addr={} err={}", bind_addr, err);
+                tracing::error!("[WS] bind failed: {}", err);
                 self.set_online(&app, false).await;
-                self.emit_log(
-                    &app,
-                    None,
-                    "ERROR",
-                    format!("WS bind failed on {}: {}", bind_addr, err),
-                )
-                .await;
+                self.emit_log(&app, None, "ERROR", format!("ws: bind failed: {}", err))
+                    .await;
                 return;
             }
         };
 
         self.set_online(&app, true).await;
         tracing::info!("[WS] listening addr={}", bind_addr);
-        self.emit_log(
-            &app,
-            None,
-            "INFO",
-            format!("WS server listening on 0.0.0.0:{}", WS_PORT),
-        )
-        .await;
+        self.emit_log(&app, None, "INFO", format!("WS server listening on {}", bind_addr))
+            .await;
 
         let router = Router::new().route("/ws/agent", get(ws_agent_handler)).with_state(HttpState {
             manager: self.clone(),
@@ -371,70 +397,31 @@ impl ServerManager {
 
         if let Err(err) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
             self.set_online(&app, false).await;
-            tracing::error!("[WS] server stopped err={}", err);
-            self.emit_log(
-                &app,
-                None,
-                "ERROR",
-                format!("WS server stopped: {}", err),
-            )
-            .await;
+            self.emit_log(&app, None, "ERROR", format!("WS server stopped: {}", err))
+                .await;
         }
     }
 
     async fn run_udp_provision_loop(&self, app: AppHandle) {
         let send_socket = match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(socket) => socket,
+            Ok(s) => s,
             Err(err) => {
-                self.emit_log(
-                    &app,
-                    None,
-                    "ERROR",
-                    format!("UDP broadcast socket error: {}", err),
-                )
-                .await;
+                self.emit_log(&app, None, "ERROR", format!("UDP broadcast socket error: {}", err))
+                    .await;
                 return;
             }
         };
-
         if let Err(err) = send_socket.set_broadcast(true) {
-            self.emit_log(
-                &app,
-                None,
-                "ERROR",
-                format!("UDP broadcast enable failed: {}", err),
-            )
-            .await;
+            self.emit_log(&app, None, "ERROR", format!("UDP broadcast enable failed: {}", err))
+                .await;
             return;
         }
 
-        let ack_socket = match UdpSocket::bind(format!("0.0.0.0:{}", UDP_PORT)).await {
-            Ok(socket) => socket,
-            Err(err) => {
-                self.emit_log(
-                    &app,
-                    None,
-                    "WARN",
-                    format!("UDP ack listener unavailable on {}: {}", UDP_PORT, err),
-                )
-                .await;
-                self.broadcast_only_loop(&app, &send_socket).await;
-                return;
-            }
-        };
-
+        let ack_socket = UdpSocket::bind(format!("0.0.0.0:{}", UDP_PORT)).await.ok();
         let admin_ip = detect_local_ipv4()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());
         let destination = format!("255.255.255.255:{}", UDP_PORT);
-        let mut ack_buffer = [0_u8; 2048];
-
-        tracing::info!(
-            "[PROVISION] broadcasting udp_port={} admin_ip={} destination={}",
-            UDP_PORT,
-            admin_ip,
-            destination
-        );
         self.emit_log(
             &app,
             None,
@@ -443,21 +430,14 @@ impl ServerManager {
         )
         .await;
 
+        let mut ack_buffer = [0_u8; 2048];
         loop {
-            let is_online = {
-                let state = self.inner.lock().await;
-                state.online
-            };
-            if !is_online {
+            if !self.inner.lock().await.online {
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
 
-            let secret = {
-                let state = self.inner.lock().await;
-                state.pair_token.clone()
-            };
-
+            let secret = self.inner.lock().await.pair_token.clone();
             let payload = ProvisionBroadcast {
                 message_type: "LABSCAN_PROVISION".to_string(),
                 v: 1,
@@ -465,76 +445,26 @@ impl ServerManager {
                 secret,
                 nonce: Uuid::new_v4().to_string(),
             };
-
             if let Ok(raw) = serde_json::to_vec(&payload) {
                 let _ = send_socket.send_to(&raw, &destination).await;
             }
 
-            if let Ok(result) = tokio::time::timeout(
-                Duration::from_millis(400),
-                ack_socket.recv_from(&mut ack_buffer),
-            )
-            .await
-            {
-                if let Ok((len, sender)) = result {
-                    if let Ok(ack) = serde_json::from_slice::<ProvisionAck>(&ack_buffer[..len]) {
-                        if ack.message_type == "LABSCAN_PROVISION_ACK" && ack.v == 1 {
-                            self.emit_log(
-                                &app,
-                                Some(ack.agent_id),
-                                "INFO",
-                                format!(
-                                    "Provision ACK from {} ({}) nonce={} ts={}",
-                                    ack.hostname, sender, ack.nonce, ack.ts
-                                ),
-                            )
-                            .await;
+            if let Some(socket) = &ack_socket {
+                if let Ok(result) = tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut ack_buffer)).await {
+                    if let Ok((len, sender)) = result {
+                        if let Ok(ack) = serde_json::from_slice::<ProvisionAck>(&ack_buffer[..len]) {
+                            if ack.message_type == "LABSCAN_PROVISION_ACK" && ack.v == 1 {
+                                self.emit_log(
+                                    &app,
+                                    Some(ack.agent_id),
+                                    "INFO",
+                                    format!("Provision ACK from {} ({}) nonce={} ts={}", ack.hostname, sender, ack.nonce, ack.ts),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
-            }
-
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-
-    async fn broadcast_only_loop(&self, _app: &AppHandle, send_socket: &UdpSocket) {
-        let admin_ip = detect_local_ipv4()
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let destination = format!("255.255.255.255:{}", UDP_PORT);
-        tracing::info!(
-            "[PROVISION] broadcast-only mode udp_port={} admin_ip={} destination={}",
-            UDP_PORT,
-            admin_ip,
-            destination
-        );
-
-        loop {
-            let is_online = {
-                let state = self.inner.lock().await;
-                state.online
-            };
-            if !is_online {
-                sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-
-            let secret = {
-                let state = self.inner.lock().await;
-                state.pair_token.clone()
-            };
-
-            let payload = ProvisionBroadcast {
-                message_type: "LABSCAN_PROVISION".to_string(),
-                v: 1,
-                admin_ip: admin_ip.clone(),
-                secret,
-                nonce: Uuid::new_v4().to_string(),
-            };
-
-            if let Ok(raw) = serde_json::to_vec(&payload) {
-                let _ = send_socket.send_to(&raw, &destination).await;
             }
             sleep(Duration::from_secs(1)).await;
         }
@@ -542,106 +472,98 @@ impl ServerManager {
 
     async fn heartbeat_watchdog(&self, app: AppHandle) {
         loop {
-            sleep(Duration::from_secs(5)).await;
-
+            sleep(Duration::from_secs(3)).await;
             let now = now_ms();
-            let mut timed_out = Vec::new();
-
+            let mut ids = Vec::new();
             {
                 let mut state = self.inner.lock().await;
-                for device in state.devices.values_mut() {
-                    if device.connected && now - device.last_seen > HEARTBEAT_TIMEOUT_MS {
-                        device.connected = false;
-                        device.status = "offline".to_string();
-                        timed_out.push(device.clone());
+                for d in state.devices.values_mut() {
+                    if d.status != "offline" && now - d.last_seen_ms > HEARTBEAT_TIMEOUT_MS {
+                        d.status = "offline".to_string();
+                        ids.push(d.agent_id.clone());
                     }
                 }
-                for device in &timed_out {
-                    state.connections.remove(&device.agent_id);
+            }
+            for id in ids {
+                if let Some(device) = self.inner.lock().await.devices.get(&id).cloned() {
+                    self.emit_device_upsert_if_needed(&app, device.clone(), true).await;
+                    self.emit_activity(
+                        &app,
+                        "device_disconnected",
+                        Some(id),
+                        format!("{} disconnected (heartbeat timeout)", device.hostname),
+                    )
+                    .await;
                 }
-            }
-
-            for device in timed_out {
-                self.emit_device_upsert(&app, device.clone()).await;
-                self.emit_log(
-                    &app,
-                    Some(device.agent_id),
-                    "WARN",
-                    "Agent heartbeat timeout, marked offline".to_string(),
-                )
-                .await;
-            }
-
-            if !self.inner.lock().await.online {
-                self.emit_server_status(&app).await;
             }
         }
     }
 
     async fn dispatch_task_now(&self, task: TaskRecord) -> TaskRecord {
-        let dispatch_payload = TaskDispatchPayload {
+        let payload = TaskDispatchPayload {
             task_id: task.task_id.clone(),
             kind: task.kind.clone(),
             params: task.params.clone(),
         };
-
         let mut started = false;
         {
             let state = self.inner.lock().await;
-            for agent_id in &task.assigned_agents {
-                if let Some(sender) = state.connections.get(agent_id) {
-                    let outgoing = WireMessage {
+            for agent in &task.assigned_agents {
+                if let Some(sender) = state.connections.get(agent) {
+                    let msg = WireMessage {
                         message_type: "task".to_string(),
                         ts: now_ms(),
-                        agent_id: agent_id.clone(),
-                        payload: serde_json::to_value(&dispatch_payload).unwrap_or_else(|_| json!({})),
+                        agent_id: agent.clone(),
+                        payload: serde_json::to_value(&payload).unwrap_or_else(|_| json!({})),
                     };
-
-                    if let Ok(raw) = serde_json::to_string(&outgoing) {
+                    if let Ok(raw) = serde_json::to_string(&msg) {
                         let _ = sender.send(Message::Text(raw.into()));
                         started = true;
                     }
                 }
             }
         }
-
-        let updated = {
-            let mut state = self.inner.lock().await;
-            if let Some(existing) = state.tasks.get_mut(&task.task_id) {
-                if started {
-                    existing.status = "running".to_string();
-                    existing.started_at = Some(now_ms());
-                }
-                existing.clone()
-            } else {
-                task
+        let mut state = self.inner.lock().await;
+        if let Some(existing) = state.tasks.get_mut(&task.task_id) {
+            if started {
+                existing.status = "running".to_string();
+                existing.started_at = Some(now_ms());
             }
-        };
-
-        updated
+            existing.clone()
+        } else {
+            task
+        }
     }
 
     async fn set_online(&self, app: &AppHandle, online: bool) {
-        {
-            let mut state = self.inner.lock().await;
-            state.online = online;
-        }
+        self.inner.lock().await.online = online;
         self.emit_server_status(app).await;
     }
 
     async fn emit_server_status(&self, app: &AppHandle) {
-        let status = self.get_status().await;
-        let _ = app.emit(EVENT_SERVER_STATUS, status);
+        let _ = app.emit(EVENT_SERVER_STATUS, self.get_status().await);
     }
 
     async fn emit_devices_snapshot(&self, app: &AppHandle) {
-        let snapshot = self.get_devices_snapshot().await;
-        let _ = app.emit(EVENT_DEVICES_SNAPSHOT, snapshot);
+        let _ = app.emit(EVENT_DEVICES_SNAPSHOT, self.get_devices_snapshot().await);
     }
 
-    async fn emit_device_upsert(&self, app: &AppHandle, device: DeviceRecord) {
-        let _ = app.emit(EVENT_DEVICE_UPSERT, DeviceUpsertEvent { device });
-        self.emit_devices_snapshot(app).await;
+    async fn emit_device_upsert_if_needed(&self, app: &AppHandle, device: DeviceRecord, force: bool) {
+        let now = now_ms();
+        let should = {
+            let mut state = self.inner.lock().await;
+            let last = state.last_device_emit_ms.get(&device.agent_id).copied().unwrap_or(0);
+            if force || now - last >= DEVICE_EMIT_THROTTLE_MS {
+                state.last_device_emit_ms.insert(device.agent_id.clone(), now);
+                true
+            } else {
+                false
+            }
+        };
+        if should {
+            let _ = app.emit(EVENT_DEVICE_UPSERT, DeviceUpsertEvent { device });
+            self.emit_devices_snapshot(app).await;
+        }
     }
 
     async fn emit_device_remove(&self, app: &AppHandle, agent_id: String) {
@@ -655,12 +577,12 @@ impl ServerManager {
 
     async fn emit_log(&self, app: &AppHandle, agent_id: Option<String>, level: &str, message: String) {
         let event = LogEvent {
+            id: Uuid::new_v4().to_string(),
             agent_id,
             level: level.to_string(),
             message,
             ts: now_ms(),
         };
-
         {
             let mut state = self.inner.lock().await;
             state.logs.push_front(event.clone());
@@ -668,28 +590,86 @@ impl ServerManager {
                 state.logs.pop_back();
             }
         }
-
         let _ = app.emit(EVENT_LOG, event);
     }
 
+    async fn emit_activity(&self, app: &AppHandle, kind: &str, agent_id: Option<String>, message: String) {
+        let now = now_ms();
+        if let Some(ref id) = agent_id {
+            let drop_event = {
+                let state = self.inner.lock().await;
+                now - state.last_activity_emit_ms.get(id).copied().unwrap_or(0) < DEVICE_ACTIVITY_RATE_MS
+            };
+            if drop_event {
+                return;
+            }
+        }
+
+        let event = {
+            let mut state = self.inner.lock().await;
+            if let Some(ref id) = agent_id {
+                state.last_activity_emit_ms.insert(id.clone(), now);
+            }
+
+            if let Some(front) = state.activity.front_mut() {
+                if front.kind == kind && front.agent_id == agent_id && now - front.ts <= ACTIVITY_DEDUPE_MS {
+                    front.ts = now;
+                    front.count = Some(front.count.unwrap_or(1) + 1);
+                    front.clone()
+                } else {
+                    let e = ActivityEvent {
+                        id: Uuid::new_v4().to_string(),
+                        kind: kind.to_string(),
+                        agent_id,
+                        message,
+                        ts: now,
+                        count: None,
+                    };
+                    state.activity.push_front(e.clone());
+                    while state.activity.len() > MAX_ACTIVITY {
+                        state.activity.pop_back();
+                    }
+                    e
+                }
+            } else {
+                let e = ActivityEvent {
+                    id: Uuid::new_v4().to_string(),
+                    kind: kind.to_string(),
+                    agent_id,
+                    message,
+                    ts: now,
+                    count: None,
+                };
+                state.activity.push_front(e.clone());
+                e
+            }
+        };
+
+        let _ = app.emit(EVENT_ACTIVITY, event);
+    }
+
     async fn on_agent_disconnect(&self, app: &AppHandle, agent_id: String) {
-        let maybe_device = {
+        let device = {
             let mut state = self.inner.lock().await;
             state.connections.remove(&agent_id);
-            if let Some(device) = state.devices.get_mut(&agent_id) {
-                device.connected = false;
-                device.status = "offline".to_string();
-                device.last_seen = now_ms();
-                Some(device.clone())
+            if let Some(d) = state.devices.get_mut(&agent_id) {
+                d.status = "offline".to_string();
+                d.last_seen_ms = now_ms();
+                Some(d.clone())
             } else {
                 None
             }
         };
 
-        if let Some(device) = maybe_device {
-            self.emit_device_upsert(app, device).await;
-            self.emit_log(app, Some(agent_id), "WARN", "Agent disconnected".to_string())
-                .await;
+        if let Some(device) = device {
+            self.emit_device_upsert_if_needed(app, device.clone(), true).await;
+            self.emit_activity(
+                app,
+                "device_disconnected",
+                Some(device.agent_id.clone()),
+                format!("{} disconnected", device.hostname),
+            )
+            .await;
         } else {
             self.emit_device_remove(app, agent_id).await;
         }
@@ -730,56 +710,23 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
 
     while let Some(incoming) = receiver.next().await {
         let message = match incoming {
-            Ok(message) => message,
-            Err(err) => {
-                tracing::warn!("[WS] receive error remote={} err={}", remote, err);
-                state
-                    .manager
-                    .emit_log(
-                        &state.app,
-                        registered_agent_id.clone(),
-                        "WARN",
-                        format!("[WS] receive error remote={} err={}", remote, err),
-                    )
-                    .await;
-                break;
-            }
+            Ok(m) => m,
+            Err(_) => break,
         };
-
         let text = match message {
-            Message::Text(text) => text,
+            Message::Text(t) => t,
             _ => continue,
         };
 
-        let parsed = serde_json::from_str::<WireMessage>(&text);
-        let incoming = match parsed {
-            Ok(value) => value,
+        let wire = match serde_json::from_str::<WireMessage>(&text) {
+            Ok(v) => v,
             Err(_) => continue,
         };
 
-        tracing::info!(
-            "[WS] message remote={} type={} agent_id={}",
-            remote,
-            incoming.message_type,
-            incoming.agent_id
-        );
-
-        if incoming.message_type == "register" {
-            let payload = match serde_json::from_value::<RegisterPayload>(incoming.payload) {
-                Ok(payload) => payload,
-                Err(err) => {
-                    tracing::warn!("[WS] register parse failed remote={} err={}", remote, err);
-                    state
-                        .manager
-                        .emit_log(
-                            &state.app,
-                            None,
-                            "WARN",
-                            format!("[WS] register parse failed remote={} err={}", remote, err),
-                        )
-                        .await;
-                    continue;
-                }
+        if wire.message_type == "register" {
+            let payload = match serde_json::from_value::<RegisterPayload>(wire.payload) {
+                Ok(v) => v,
+                Err(_) => continue,
             };
 
             let secret_ok = {
@@ -792,30 +739,19 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                 payload.agent_id,
                 secret_ok
             );
-            state
-                .manager
-                .emit_log(
-                    &state.app,
-                    Some(payload.agent_id.clone()),
-                    if secret_ok { "INFO" } else { "WARN" },
-                    format!(
-                        "[WS] message type=register agent_id={} ok={}",
-                        payload.agent_id, secret_ok
-                    ),
-                )
-                .await;
 
-            let registered = if secret_ok {
-                json!({"ok": true})
+            let response = if secret_ok {
+                json!({"ok": true, "server_time": now_ms()})
             } else {
-                json!({"ok": false, "error": "invalid shared secret"})
+                json!({"ok": false, "error": "invalid shared secret", "server_time": now_ms()})
             };
+
             let _ = tx.send(Message::Text(
                 json!({
                     "type": "registered",
                     "ts": now_ms(),
                     "agent_id": payload.agent_id,
-                    "payload": registered
+                    "payload": response
                 })
                 .to_string()
                 .into(),
@@ -825,38 +761,70 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                 break;
             }
 
-            let device = DeviceRecord {
-                agent_id: payload.agent_id.clone(),
-                hostname: payload.hostname,
-                ips: payload.ips,
-                os: payload.os,
-                arch: payload.arch,
-                version: payload.version,
-                status: "online".to_string(),
-                last_seen: now_ms(),
-                connected: true,
-                last_metrics: None,
-            };
-
-            {
+            let now = now_ms();
+            let (device, was_new, old_status) = {
                 let mut guard = state.manager.inner.lock().await;
                 guard.connections.insert(payload.agent_id.clone(), tx.clone());
-                guard.devices.insert(payload.agent_id.clone(), device.clone());
-            }
+                let was_new = !guard.devices.contains_key(&payload.agent_id);
+                if was_new {
+                    guard.device_order.push(payload.agent_id.clone());
+                }
 
-            tracing::info!("[WS] agent upserted agent_id={}", payload.agent_id);
+                let entry = guard.devices.entry(payload.agent_id.clone()).or_insert(DeviceRecord {
+                    agent_id: payload.agent_id.clone(),
+                    hostname: payload.hostname.clone(),
+                    ips: payload.ips.clone(),
+                    os: payload.os.clone(),
+                    version: payload.version.clone(),
+                    status: "online".to_string(),
+                    last_seen_ms: now,
+                    internet_reachable: None,
+                    dns_ok: None,
+                    gateway_reachable: None,
+                    latency_ms: None,
+                    last_internet_change_ms: None,
+                    last_dns_change_ms: None,
+                    first_seen_ms: now,
+                });
 
-            registered_agent_id = Some(payload.agent_id.clone());
-            state.manager.emit_device_upsert(&state.app, device).await;
+                let old_status = entry.status.clone();
+                entry.hostname = payload.hostname;
+                entry.ips = payload.ips;
+                entry.os = payload.os;
+                entry.version = payload.version;
+                entry.status = "online".to_string();
+                entry.last_seen_ms = now;
+                (entry.clone(), was_new, old_status)
+            };
+
+            registered_agent_id = Some(device.agent_id.clone());
             state
                 .manager
-                .emit_log(
-                    &state.app,
-                    Some(payload.agent_id),
-                    "INFO",
-                    "Agent registered".to_string(),
-                )
+                .emit_device_upsert_if_needed(&state.app, device.clone(), true)
                 .await;
+
+            if was_new {
+                state
+                    .manager
+                    .emit_activity(
+                        &state.app,
+                        "device_connected",
+                        Some(device.agent_id.clone()),
+                        format!("{} connected", device.hostname),
+                    )
+                    .await;
+            }
+            if old_status != "online" {
+                state
+                    .manager
+                    .emit_activity(
+                        &state.app,
+                        "device_status_changed",
+                        Some(device.agent_id.clone()),
+                        format!("{} status {} -> online", device.hostname, old_status),
+                    )
+                    .await;
+            }
             continue;
         }
 
@@ -865,58 +833,139 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
             None => continue,
         };
 
-        match incoming.message_type.as_str() {
+        match wire.message_type.as_str() {
             "heartbeat" => {
-                if let Ok(payload) = serde_json::from_value::<HeartbeatPayload>(incoming.payload) {
-                    tracing::info!("[WS] heartbeat agent_id={}", agent_id);
-                    state
-                        .manager
-                        .emit_log(
-                            &state.app,
-                            Some(agent_id.clone()),
-                            "DEBUG",
-                            format!("[WS] heartbeat agent_id={}", agent_id),
-                        )
-                        .await;
-
-                    let maybe_device = {
+                if let Ok(payload) = serde_json::from_value::<HeartbeatPayload>(wire.payload) {
+                    tracing::debug!("[WS] heartbeat agent_id={}", agent_id);
+                    let now = now_ms();
+                    let (device_opt, status_changed, internet_changed, dns_changed) = {
                         let mut guard = state.manager.inner.lock().await;
                         if let Some(device) = guard.devices.get_mut(&agent_id) {
-                            device.last_seen = if payload.last_seen > 0 {
-                                payload.last_seen
+                            let old_status = device.status.clone();
+                            let old_internet = device.internet_reachable;
+                            let old_dns = device.dns_ok;
+
+                            device.last_seen_ms = if payload.last_seen > 0 { payload.last_seen } else { now };
+                            if !payload.status.is_empty() {
+                                device.status = payload.status;
+                            }
+                            if let Some(metrics) = payload.metrics {
+                                if let Some(v) = metrics.get("internet_reachable") {
+                                    device.internet_reachable = v.as_bool();
+                                }
+                                if let Some(v) = metrics.get("dns_ok") {
+                                    device.dns_ok = v.as_bool();
+                                }
+                                if let Some(v) = metrics.get("gateway_reachable") {
+                                    device.gateway_reachable = v.as_bool();
+                                }
+                                if let Some(v) = metrics.get("latency_ms") {
+                                    device.latency_ms = v.as_i64();
+                                }
+                            }
+
+                            let status_changed = if old_status != device.status {
+                                Some((old_status, device.status.clone()))
                             } else {
-                                now_ms()
+                                None
                             };
-                            device.connected = true;
-                            device.status = payload.status;
-                            device.last_metrics = payload.metrics;
-                            Some(device.clone())
+
+                            let internet_changed = if old_internet != device.internet_reachable {
+                                device.last_internet_change_ms = Some(now);
+                                Some((old_internet, device.internet_reachable))
+                            } else {
+                                None
+                            };
+
+                            let dns_changed = if old_dns != device.dns_ok {
+                                device.last_dns_change_ms = Some(now);
+                                Some((old_dns, device.dns_ok))
+                            } else {
+                                None
+                            };
+
+                            (Some(device.clone()), status_changed, internet_changed, dns_changed)
                         } else {
-                            None
+                            (None, None, None, None)
                         }
                     };
-                    if let Some(device) = maybe_device {
-                        state.manager.emit_device_upsert(&state.app, device).await;
+
+                    if let Some(device) = device_opt {
+                        state
+                            .manager
+                            .emit_device_upsert_if_needed(&state.app, device.clone(), false)
+                            .await;
+
+                        if let Some((old, new)) = status_changed {
+                            state
+                                .manager
+                                .emit_activity(
+                                    &state.app,
+                                    "device_status_changed",
+                                    Some(device.agent_id.clone()),
+                                    format!("{} status {} -> {}", device.hostname, old, new),
+                                )
+                                .await;
+                        }
+                        if let Some((old, new)) = internet_changed {
+                            state
+                                .manager
+                                .emit_log(
+                                    &state.app,
+                                    Some(device.agent_id.clone()),
+                                    "INFO",
+                                    format!("internet_reachable changed {:?} -> {:?}", old, new),
+                                )
+                                .await;
+                            state
+                                .manager
+                                .emit_activity(
+                                    &state.app,
+                                    "internet_status_changed",
+                                    Some(device.agent_id.clone()),
+                                    format!("{} internet {:?} -> {:?}", device.hostname, old, new),
+                                )
+                                .await;
+                        }
+                        if let Some((old, new)) = dns_changed {
+                            state
+                                .manager
+                                .emit_log(
+                                    &state.app,
+                                    Some(device.agent_id.clone()),
+                                    "INFO",
+                                    format!("dns_ok changed {:?} -> {:?}", old, new),
+                                )
+                                .await;
+                            state
+                                .manager
+                                .emit_activity(
+                                    &state.app,
+                                    "dns_status_changed",
+                                    Some(device.agent_id.clone()),
+                                    format!("{} dns {:?} -> {:?}", device.hostname, old, new),
+                                )
+                                .await;
+                        }
                     }
                 }
             }
             "task_result" => {
-                if let Ok(payload) = serde_json::from_value::<TaskResultPayload>(incoming.payload) {
+                if let Ok(payload) = serde_json::from_value::<TaskResultPayload>(wire.payload) {
                     let maybe_task = {
                         let mut guard = state.manager.inner.lock().await;
                         if let Some(task) = guard.tasks.get_mut(&payload.task_id) {
-                            task.results.retain(|entry| entry.agent_id != agent_id);
+                            task.results.retain(|r| r.agent_id != agent_id);
                             task.results.push(TaskResultRecord {
                                 agent_id: agent_id.clone(),
                                 ok: payload.ok,
                                 result: payload.result,
-                                error: payload.error.clone(),
+                                error: payload.error,
                                 ts: now_ms(),
                             });
-
                             if task.results.len() == task.assigned_agents.len() {
                                 task.ended_at = Some(now_ms());
-                                task.status = if task.results.iter().all(|entry| entry.ok) {
+                                task.status = if task.results.iter().all(|r| r.ok) {
                                     "done".to_string()
                                 } else {
                                     "failed".to_string()
@@ -929,14 +978,21 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                     };
 
                     if let Some(task) = maybe_task {
-                        state.manager.emit_task_update(&state.app, task).await;
+                        state.manager.emit_task_update(&state.app, task.clone()).await;
+                        let kind = if task.status == "failed" {
+                            "task_failed"
+                        } else if task.status == "done" {
+                            "task_completed"
+                        } else {
+                            "task_started"
+                        };
                         state
                             .manager
-                            .emit_log(
+                            .emit_activity(
                                 &state.app,
+                                kind,
                                 Some(agent_id),
-                                if payload.ok { "INFO" } else { "ERROR" },
-                                format!("Task result received for {}", payload.task_id),
+                                format!("Task {} status {}", task.task_id, task.status),
                             )
                             .await;
                     }
@@ -949,18 +1005,7 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
     write_task.abort();
     if let Some(agent_id) = registered_agent_id {
         tracing::info!("[WS] disconnect agent_id={}", agent_id);
-        state
-            .manager
-            .emit_log(
-                &state.app,
-                Some(agent_id.clone()),
-                "INFO",
-                format!("[WS] disconnect agent_id={}", agent_id),
-            )
-            .await;
         state.manager.on_agent_disconnect(&state.app, agent_id).await;
-    } else {
-        tracing::info!("[WS] disconnect remote={} agent_id=unknown", remote);
     }
 }
 

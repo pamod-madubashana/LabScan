@@ -5,7 +5,7 @@ import { formatSince, useLabScan } from "@/lib/labscan";
 export function TopStatusBar() {
   const { state, ready } = useLabScan();
 
-  const onlineAgents = state.devices.filter((device) => device.connected).length;
+  const onlineAgents = state.devices.filter((device) => device.status !== "offline").length;
   const lastLog = state.logs[0];
 
   return (
@@ -41,7 +41,7 @@ export function TopStatusBar() {
             </div>
           </TooltipTrigger>
           <TooltipContent className="bg-card border-border text-foreground">
-            {state.devices.filter((device) => device.connected).length} currently connected websocket sessions
+            {state.devices.filter((device) => device.status !== "offline").length} currently connected websocket sessions
           </TooltipContent>
         </Tooltip>
 

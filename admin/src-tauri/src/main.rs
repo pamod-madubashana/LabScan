@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get_server_status,
             get_devices_snapshot,
             get_tasks_snapshot,
+            get_activity_snapshot,
             dispatch_task,
             get_pair_token,
             rotate_pair_token,
@@ -61,6 +62,13 @@ async fn get_tasks_snapshot(
     state: tauri::State<'_, server::ServerManager>,
 ) -> Result<server::TasksSnapshot, String> {
     Ok(state.get_tasks_snapshot().await)
+}
+
+#[tauri::command]
+async fn get_activity_snapshot(
+    state: tauri::State<'_, server::ServerManager>,
+) -> Result<server::ActivitySnapshot, String> {
+    Ok(state.get_activity_snapshot().await)
 }
 
 #[tauri::command]

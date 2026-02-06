@@ -3,19 +3,23 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { logger } from "@/lib/logger";
 
-type DeviceStatus = "online" | "idle" | "scanning" | "offline" | "unreachable";
+export type DeviceStatus = "online" | "idle" | "scanning" | "offline";
 
 export interface DeviceRecord {
   agent_id: string;
   hostname: string;
   ips: string[];
   os: string;
-  arch: string;
   version: string;
   status: DeviceStatus;
-  last_seen: number;
-  connected: boolean;
-  last_metrics?: Record<string, unknown>;
+  last_seen_ms: number;
+  internet_reachable: boolean | null;
+  dns_ok: boolean | null;
+  gateway_reachable: boolean | null;
+  latency_ms: number | null;
+  last_internet_change_ms: number | null;
+  last_dns_change_ms: number | null;
+  first_seen_ms: number;
 }
 
 export interface TaskResultRecord {
@@ -46,6 +50,15 @@ export interface LogRecord {
   message: string;
 }
 
+export interface ActivityEvent {
+  id: string;
+  kind: string;
+  agent_id?: string;
+  message: string;
+  ts: number;
+  count?: number;
+}
+
 export interface ServerStatus {
   online: boolean;
   port_ws: number;
@@ -57,6 +70,7 @@ export interface LabStateSnapshot {
   devices: DeviceRecord[];
   tasks: TaskRecord[];
   logs: LogRecord[];
+  activity: ActivityEvent[];
 }
 
 interface LabScanContextValue {
@@ -73,11 +87,34 @@ const defaultState: LabStateSnapshot = {
   devices: [],
   tasks: [],
   logs: [],
+  activity: [],
 };
 
 const LabScanContext = createContext<LabScanContextValue | null>(null);
 
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+function mergeStableDeviceList(current: DeviceRecord[], incoming: DeviceRecord[]): DeviceRecord[] {
+  const byId = new Map(incoming.map((item) => [item.agent_id, item]));
+  const next: DeviceRecord[] = [];
+
+  for (const existing of current) {
+    const updated = byId.get(existing.agent_id);
+    if (updated) {
+      next.push(updated);
+      byId.delete(existing.agent_id);
+    }
+  }
+
+  const newEntries = Array.from(byId.values()).sort((a, b) => {
+    if (a.first_seen_ms !== b.first_seen_ms) {
+      return a.first_seen_ms - b.first_seen_ms;
+    }
+    return a.hostname.localeCompare(b.hostname);
+  });
+
+  return [...next, ...newEntries];
+}
 
 export function LabScanProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<LabStateSnapshot>(defaultState);
@@ -94,54 +131,46 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        const [server, devicesSnapshot, tasksSnapshot] = await Promise.all([
+        const [server, devicesSnapshot, tasksSnapshot, activitySnapshot] = await Promise.all([
           invoke<ServerStatus>("get_server_status"),
           invoke<{ devices: DeviceRecord[] }>("get_devices_snapshot"),
           invoke<{ tasks: TaskRecord[] }>("get_tasks_snapshot"),
+          invoke<{ events: ActivityEvent[] }>("get_activity_snapshot"),
         ]);
 
         setState({
           server,
-          devices: devicesSnapshot.devices,
+          devices: mergeStableDeviceList([], devicesSnapshot.devices),
           tasks: tasksSnapshot.tasks,
           logs: [],
-        });
-        void logger.info("[UI] startup snapshots loaded", {
-          online: server.online,
-          devices: devicesSnapshot.devices.length,
-          tasks: tasksSnapshot.tasks.length,
+          activity: activitySnapshot.events,
         });
 
         const unlistenServer = await listen<ServerStatus>("server_status", (event) => {
-          void logger.info("[UI] server_status", {
-            online: event.payload.online,
-            port_ws: event.payload.port_ws,
-            port_udp: event.payload.port_udp,
-          });
           setState((prev) => ({ ...prev, server: event.payload }));
+          void logger.info("[UI] server_status", { online: event.payload.online });
         });
+
         const unlistenDevices = await listen<{ devices: DeviceRecord[] }>("devices_snapshot", (event) => {
+          setState((prev) => ({ ...prev, devices: mergeStableDeviceList(prev.devices, event.payload.devices) }));
           void logger.info("[UI] devices_snapshot", { count: event.payload.devices.length });
-          setState((prev) => ({ ...prev, devices: event.payload.devices }));
         });
+
         const unlistenDeviceUpsert = await listen<{ device: DeviceRecord }>("device_upsert", (event) => {
-          void logger.info("[UI] device_upsert", {
-            id: event.payload.device.agent_id,
-            status: event.payload.device.status,
-          });
-          setState((prev) => {
-            const map = new Map(prev.devices.map((device) => [device.agent_id, device]));
-            map.set(event.payload.device.agent_id, event.payload.device);
-            return { ...prev, devices: Array.from(map.values()) };
-          });
+          setState((prev) => ({
+            ...prev,
+            devices: mergeStableDeviceList(prev.devices, [event.payload.device, ...prev.devices]),
+          }));
         });
+
         const unlistenDeviceRemove = await listen<{ agent_id: string }>("device_remove", (event) => {
-          void logger.info("[UI] device_remove", { id: event.payload.agent_id });
           setState((prev) => ({
             ...prev,
             devices: prev.devices.filter((device) => device.agent_id !== event.payload.agent_id),
           }));
+          void logger.info("[UI] device_remove", { id: event.payload.agent_id });
         });
+
         const unlistenTaskUpdate = await listen<{ task: TaskRecord }>("task_update", (event) => {
           setState((prev) => {
             const map = new Map(prev.tasks.map((task) => [task.task_id, task]));
@@ -149,15 +178,24 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
             return { ...prev, tasks: Array.from(map.values()) };
           });
         });
-        const unlistenLog = await listen<Omit<LogRecord, "id">>("log_event", (event) => {
+
+        const unlistenLog = await listen<LogRecord>("log_event", (event) => {
           setState((prev) => ({
             ...prev,
-            logs: [{ ...event.payload, id: `${event.payload.ts}-${event.payload.agent_id ?? "server"}` }, ...prev.logs].slice(0, 400),
+            logs: [event.payload, ...prev.logs].slice(0, 400),
           }));
         });
 
-        void logger.info("[UI] subscribed events", {
-          events: ["server_status", "devices_snapshot", "device_upsert", "device_remove", "task_update", "log_event"],
+        const unlistenActivity = await listen<ActivityEvent>("activity_event", (event) => {
+          setState((prev) => {
+            const idx = prev.activity.findIndex((item) => item.id === event.payload.id);
+            if (idx >= 0) {
+              const next = [...prev.activity];
+              next[idx] = event.payload;
+              return { ...prev, activity: next };
+            }
+            return { ...prev, activity: [event.payload, ...prev.activity].slice(0, 200) };
+          });
         });
 
         unsubscribers = [
@@ -167,9 +205,13 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           unlistenDeviceRemove,
           unlistenTaskUpdate,
           unlistenLog,
+          unlistenActivity,
         ];
+
+        void logger.info("[UI] subscribed events", {
+          events: ["server_status", "devices_snapshot", "device_upsert", "device_remove", "task_update", "activity_event"],
+        });
       } catch (err) {
-        void logger.error("[UI] backend initialization failed", { error: err instanceof Error ? err.message : String(err) });
         setError(err instanceof Error ? err.message : "failed to initialize LabScan runtime");
         setState(defaultState);
       } finally {

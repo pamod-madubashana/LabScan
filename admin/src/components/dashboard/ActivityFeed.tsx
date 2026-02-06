@@ -11,9 +11,10 @@ const typeDots: Record<string, string> = {
 
 export function ActivityFeed() {
   const { state } = useLabScan();
-  const activities = state.logs.slice(0, 30).map((entry) => {
-    const type = entry.level === "ERROR" ? "error" : entry.level === "WARN" ? "warning" : "info";
-    return { id: entry.id, time: formatSince(entry.ts), message: entry.message, type };
+  const activities = state.activity.slice(0, 30).map((entry) => {
+    const type = entry.kind.includes("failed") ? "error" : entry.kind.includes("disconnect") ? "warning" : "info";
+    const suffix = entry.count && entry.count > 1 ? ` (x${entry.count})` : "";
+    return { id: entry.id, time: formatSince(entry.ts), message: `${entry.message}${suffix}`, type };
   });
 
   return (

@@ -108,6 +108,18 @@ type AgentClient struct {
 	heartbeat time.Duration
 	conn      *websocket.Conn
 	writeMu   sync.Mutex
+	probeMu   sync.Mutex
+	probe     ProbeState
+}
+
+type ProbeState struct {
+	internet          *bool
+	dns               *bool
+	gateway           *bool
+	latencyMS         *int64
+	internetFailCount int
+	dnsFailCount      int
+	gatewayFailCount  int
 }
 
 func main() {
@@ -340,6 +352,7 @@ func (c *AgentClient) runSession(parent context.Context) (bool, error) {
 	}
 
 	go c.heartbeatLoop(ctx)
+	go c.probeLoop(ctx)
 	err = <-errCh
 	if err != nil {
 		log.Printf("WS closed err=%v -> entering sleep", err)
@@ -406,11 +419,16 @@ func (c *AgentClient) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(wait):
+			internet, dns, gateway, latency := c.probeSnapshot()
 			payload := HeartbeatPayload{
 				Status:   "idle",
 				LastSeen: nowMS(),
 				Metrics: map[string]interface{}{
-					"goroutines": runtime.NumGoroutine(),
+					"goroutines":         runtime.NumGoroutine(),
+					"internet_reachable": internet,
+					"dns_ok":             dns,
+					"gateway_reachable":  gateway,
+					"latency_ms":         latency,
 				},
 			}
 			if err := c.send("heartbeat", payload); err != nil {
@@ -418,6 +436,68 @@ func (c *AgentClient) heartbeatLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (c *AgentClient) probeLoop(ctx context.Context) {
+	probeAndStore := func() {
+		internetOK, latency := probeInternet()
+		dnsOK := probeDNS()
+		gatewayOK := probeGateway()
+
+		c.probeMu.Lock()
+		defer c.probeMu.Unlock()
+
+		c.probe.internet = applyDebounce(c.probe.internet, internetOK, &c.probe.internetFailCount)
+		c.probe.dns = applyDebounce(c.probe.dns, dnsOK, &c.probe.dnsFailCount)
+		c.probe.gateway = applyDebounce(c.probe.gateway, gatewayOK, &c.probe.gatewayFailCount)
+		if internetOK {
+			lat := latency
+			c.probe.latencyMS = &lat
+		} else {
+			c.probe.latencyMS = nil
+		}
+	}
+
+	probeAndStore()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probeAndStore()
+		}
+	}
+}
+
+func (c *AgentClient) probeSnapshot() (*bool, *bool, *bool, *int64) {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+
+	var internet *bool
+	if c.probe.internet != nil {
+		v := *c.probe.internet
+		internet = &v
+	}
+	var dns *bool
+	if c.probe.dns != nil {
+		v := *c.probe.dns
+		dns = &v
+	}
+	var gateway *bool
+	if c.probe.gateway != nil {
+		v := *c.probe.gateway
+		gateway = &v
+	}
+	var latency *int64
+	if c.probe.latencyMS != nil {
+		v := *c.probe.latencyMS
+		latency = &v
+	}
+
+	return internet, dns, gateway, latency
 }
 
 func (c *AgentClient) executeTask(task TaskPayload) {
@@ -623,6 +703,63 @@ func isPrivateIP(ip net.IP) bool {
 	}
 	if ip4[0] == 127 {
 		return true
+	}
+	return false
+}
+
+func applyDebounce(current *bool, probeOK bool, failCount *int) *bool {
+	if probeOK {
+		*failCount = 0
+		value := true
+		return &value
+	}
+
+	*failCount = *failCount + 1
+	if current == nil {
+		if *failCount >= 2 {
+			value := false
+			return &value
+		}
+		return nil
+	}
+
+	if *current && *failCount >= 2 {
+		value := false
+		return &value
+	}
+
+	return current
+}
+
+func probeInternet() (bool, int64) {
+	targets := []string{"1.1.1.1:443", "8.8.8.8:53"}
+	for _, target := range targets {
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", target, 2*time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return true, time.Since(start).Milliseconds()
+		}
+	}
+	return false, 0
+}
+
+func probeDNS() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resolver := net.Resolver{}
+	_, err := resolver.LookupHost(ctx, "example.com")
+	return err == nil
+}
+
+func probeGateway() bool {
+	gateways := []string{"192.168.1.1:53", "10.0.0.1:53", "172.16.0.1:53"}
+	for _, gateway := range gateways {
+		conn, err := net.DialTimeout("tcp", gateway, 1500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
 	}
 	return false
 }
