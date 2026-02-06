@@ -4,6 +4,7 @@
 mod server;
 mod database;
 mod discovery;
+mod logger;
 
 use discovery::{DiscoveryService, MDNSService};
 use std::net::{Ipv4Addr, TcpStream};
@@ -24,7 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             start_server,
             get_server_status,
-            generate_join_token
+            generate_join_token,
+            logger::log_debug,
+            logger::log_info,
+            logger::log_warn,
+            logger::log_error
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
