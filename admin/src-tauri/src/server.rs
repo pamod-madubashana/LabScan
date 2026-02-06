@@ -5,7 +5,7 @@ use axum::{
     },
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -259,8 +259,9 @@ impl ServerManager {
         });
 
         let watchdog = self.clone();
+        let app_for_watchdog = app.clone();
         tokio::spawn(async move {
-            watchdog.heartbeat_watchdog(app).await;
+            watchdog.heartbeat_watchdog(app_for_watchdog).await;
         });
 
         self.schedule_state_emit(app).await;
@@ -537,7 +538,7 @@ impl ServerManager {
     }
 }
 
-pub async fn ws_agent_handler(ws: WebSocketUpgrade, State(state): State<HttpState>) -> impl IntoResponse {
+async fn ws_agent_handler(ws: WebSocketUpgrade, State(state): State<HttpState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_agent_socket(socket, state))
 }
 
