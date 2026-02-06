@@ -76,6 +76,20 @@
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   }
 
+  .app-root {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .selectable,
+  [data-selectable='true'],
+  input,
+  textarea,
+  [contenteditable='true'] {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
   code, .font-mono {
     font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
   }
@@ -174,11 +188,11 @@
 
   /* React Flow edge baseline visibility for LabScan map */
   .labscan-map .react-flow__edge-path {
-    opacity: 0.5;
+    opacity: 0.82;
   }
 
   .labscan-map .react-flow__edge:hover .react-flow__edge-path,
   .labscan-map .react-flow__edge.selected .react-flow__edge-path {
-    opacity: 0.9;
+    opacity: 1;
   }
 }

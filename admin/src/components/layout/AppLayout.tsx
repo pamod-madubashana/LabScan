@@ -4,7 +4,7 @@ import { TopStatusBar } from "./TopStatusBar";
 
 export function AppLayout() {
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-background noise-overlay">
+    <div className="app-root flex h-screen w-full overflow-hidden bg-background noise-overlay">
       <Sidebar />
       <div className="flex flex-col flex-1 min-w-0">
         <TopStatusBar />

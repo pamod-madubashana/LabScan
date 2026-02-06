@@ -96,12 +96,11 @@ export function NetworkMapFlow() {
 
   const edges: Edge[] = useMemo(() => {
     return sortedDevices.map((device) => {
-      const hasHover = Boolean(hoveredId);
       const isConnectedToHover = hoveredId === device.agent_id;
       const highlighted = isConnectedToHover || focusedAgentId === device.agent_id;
 
-      const strokeOpacity = hasHover ? (isConnectedToHover ? 0.9 : 0.28) : 0.5;
-      const strokeWidth = hasHover ? (isConnectedToHover ? 3 : 1.8) : 2.1;
+      const strokeOpacity = highlighted ? 0.95 : 0.72;
+      const strokeWidth = highlighted ? 2.8 : 2.2;
 
       return {
         id: `admin-${device.agent_id}`,

@@ -48,8 +48,8 @@ const Tasks = () => {
                     <span className="text-sm text-foreground font-medium">{task.kind}</span>
                     <span className={cn("text-[10px] font-mono uppercase", cfg.color)}>{cfg.label}</span>
                   </div>
-                  <p className="text-xs text-muted-foreground font-mono">Task ID: {task.task_id}</p>
-                  <p className="text-xs text-muted-foreground">Agents: {task.assigned_agents.join(", ")}</p>
+                  <p className="text-xs text-muted-foreground font-mono">Task ID: <span className="selectable">{task.task_id}</span></p>
+                  <p className="text-xs text-muted-foreground">Agents: <span className="selectable font-mono">{task.assigned_agents.join(", ")}</span></p>
                   <p className="text-xs text-muted-foreground">Created: {formatSince(task.created_at)}</p>
                 </div>
                 <div className="text-right text-xs text-muted-foreground">
@@ -61,7 +61,7 @@ const Tasks = () => {
                 <div className="mt-3 pt-3 border-t border-border/30 space-y-1">
                   {task.results.map((result) => (
                     <p key={result.agent_id} className="text-xs font-mono text-muted-foreground">
-                      <span className={result.ok ? "text-green" : "text-red"}>{result.ok ? "OK" : "ERR"}</span> {result.agent_id}
+                      <span className={result.ok ? "text-green" : "text-red"}>{result.ok ? "OK" : "ERR"}</span>{" "}<span className="selectable">{result.agent_id}</span>
                       {result.error ? ` - ${result.error}` : ""}
                     </p>
                   ))}

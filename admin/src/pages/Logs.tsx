@@ -78,8 +78,8 @@ const Logs = () => {
           <div key={entry.id} className="grid grid-cols-[180px_60px_180px_1fr] gap-3 py-1 border-b border-border/10">
             <span className="text-muted-foreground">{new Date(entry.ts).toLocaleString()}</span>
             <span className={cn("font-semibold", levelClass[entry.level] ?? "text-muted-foreground")}>{entry.level}</span>
-            <span className="text-muted-foreground">{entry.agent_id ?? "server"}</span>
-            <span className="text-foreground/90">{entry.message}</span>
+            <span className="text-muted-foreground selectable">{entry.agent_id ?? "server"}</span>
+            <span className="text-foreground/90 selectable">{entry.message}</span>
           </div>
         ))}
       </div>

@@ -17,7 +17,7 @@ const Alerts = () => {
           <div key={alert.id} className="glass-panel border p-4 border-border/40">
             <p className="text-sm text-foreground">{alert.message}</p>
             <p className="text-[10px] text-muted-foreground font-mono mt-1">
-              {alert.level} · {alert.agent_id ?? "server"} · {new Date(alert.ts).toLocaleString()}
+              {alert.level} · <span className="selectable">{alert.agent_id ?? "server"}</span> · {new Date(alert.ts).toLocaleString()}
             </p>
           </div>
         ))}

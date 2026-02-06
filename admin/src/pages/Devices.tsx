@@ -69,8 +69,12 @@ const Devices = () => {
           onChange={(event) => setSelected((prev) => ({ ...prev, [device.agent_id]: event.target.checked }))}
         />
       </td>
-      <td className="px-3 py-2 text-xs font-mono text-foreground">{device.hostname}</td>
-      <td className="px-3 py-2 text-xs font-mono text-muted-foreground">{device.ips.join(", ") || "-"}</td>
+      <td className="px-3 py-2 text-xs font-mono text-foreground">
+        <span className="selectable">{device.hostname}</span>
+      </td>
+      <td className="px-3 py-2 text-xs font-mono text-muted-foreground">
+        <span className="selectable">{device.ips.join(", ") || "-"}</span>
+      </td>
       <td className="px-3 py-2 text-xs text-muted-foreground">{device.os}</td>
       <td className="px-3 py-2 text-xs font-mono text-muted-foreground">{device.version}</td>
       <td className="px-3 py-2">
