@@ -32,6 +32,10 @@ jobs:
         with:
           go-version: '1.21'
           cache: false
+      
+      - name: Build Go Agent
+        working-directory: agent
+        run: go build -o labscan-agent.exe .
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -48,9 +52,6 @@ jobs:
           cd admin
           npm install -g @tauri-apps/cli
       
-      - name: Build Go Agent
-        working-directory: agent
-        run: go build -o labscan-agent.exe .
 
       - name: Build Tauri app
         run: |
