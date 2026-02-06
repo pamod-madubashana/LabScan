@@ -34,8 +34,9 @@ jobs:
           cache: false
       
       - name: Build Go Agent
-        working-directory: agent
-        run: go build -o labscan-agent.exe .
+        run: |
+          cd agent
+          go build -o labscan-agent.exe .
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -44,6 +45,7 @@ jobs:
 
       - name: Install frontend dependencies
         run: |
+          cd ..
           cd admin
           npm install
 
