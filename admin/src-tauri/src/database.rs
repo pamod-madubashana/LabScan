@@ -1,9 +1,9 @@
-use rusqlite::{Connection, Result};
+use rusqlite::{params, Connection, Result};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct Database {
-    conn: Connection,
+    pub conn: Connection,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -90,19 +90,19 @@ impl Database {
             (id, hostname, os, arch, agent_version, local_ip, mac_address, 
              gateway_ip, dns_servers, registered_at, last_seen, is_online)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            [
-                &device.id,
-                &device.hostname,
-                &device.os,
-                &device.arch,
-                &device.agent_version,
-                &device.local_ip,
-                &device.mac_address.as_deref().unwrap_or(""),
-                &device.gateway_ip.as_deref().unwrap_or(""),
-                &device.dns_servers.as_deref().unwrap_or(""),
-                &device.registered_at.to_string(),
-                &device.last_seen.to_string(),
-                &(device.is_online as i32).to_string(),
+            params![
+                device.id,
+                device.hostname,
+                device.os,
+                device.arch,
+                device.agent_version,
+                device.local_ip,
+                device.mac_address.unwrap_or_default(),
+                device.gateway_ip.unwrap_or_default(),
+                device.dns_servers.unwrap_or_default(),
+                device.registered_at,
+                device.last_seen,
+                device.is_online,
             ],
         )?;
         Ok(())
@@ -113,14 +113,14 @@ impl Database {
             "INSERT INTO heartbeats 
             (id, device_id, timestamp, gateway_reachable, dns_resolves, https_latency_ms, local_ports)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            [
-                &heartbeat.id,
-                &heartbeat.device_id,
-                &heartbeat.timestamp.to_string(),
-                &(heartbeat.gateway_reachable as i32).to_string(),
-                &(heartbeat.dns_resolves as i32).to_string(),
-                &heartbeat.https_latency_ms.map(|v| v.to_string()).unwrap_or_default(),
-                &heartbeat.local_ports.as_deref().unwrap_or(""),
+            params![
+                heartbeat.id,
+                heartbeat.device_id,
+                heartbeat.timestamp,
+                heartbeat.gateway_reachable,
+                heartbeat.dns_resolves,
+                heartbeat.https_latency_ms,
+                heartbeat.local_ports.unwrap_or_default(),
             ],
         )?;
         Ok(())
@@ -129,7 +129,7 @@ impl Database {
     pub fn update_device_last_seen(&mut self, device_id: &str, timestamp: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE devices SET last_seen = ?1, is_online = 1 WHERE id = ?2",
-            [timestamp.to_string(), device_id.to_string()],
+            params![timestamp, device_id],
         )?;
         Ok(())
     }
@@ -138,9 +138,9 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, hostname, os, arch, agent_version, local_ip, mac_address, 
                     gateway_ip, dns_servers, registered_at, last_seen, is_online 
-             FROM devices ORDER BY last_seen DESC"
+             FROM devices ORDER BY last_seen DESC",
         )?;
-        
+
         let device_iter = stmt.query_map([], |row| {
             Ok(Device {
                 id: row.get(0)?,
@@ -151,15 +151,27 @@ impl Database {
                 local_ip: row.get(5)?,
                 mac_address: {
                     let mac: String = row.get(6)?;
-                    if mac.is_empty() { None } else { Some(mac) }
+                    if mac.is_empty() {
+                        None
+                    } else {
+                        Some(mac)
+                    }
                 },
                 gateway_ip: {
                     let gw: String = row.get(7)?;
-                    if gw.is_empty() { None } else { Some(gw) }
+                    if gw.is_empty() {
+                        None
+                    } else {
+                        Some(gw)
+                    }
                 },
                 dns_servers: {
                     let dns: String = row.get(8)?;
-                    if dns.is_empty() { None } else { Some(dns) }
+                    if dns.is_empty() {
+                        None
+                    } else {
+                        Some(dns)
+                    }
                 },
                 registered_at: row.get(9)?,
                 last_seen: row.get(10)?,

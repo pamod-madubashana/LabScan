@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -27,13 +26,13 @@ pub struct DiscoveryService {
 }
 
 impl DiscoveryService {
-    pub async fn new(admin_ip: Ipv4Addr, tls_fingerprint: String) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(admin_ip: Ipv4Addr, tls_fingerprint: String) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let socket = UdpSocket::bind(format!("0.0.0.0:{}", MULTICAST_PORT)).await?;
         
         let multi_addr = MULTICAST_GROUP.parse::<Ipv4Addr>()?;
         let interface = Ipv4Addr::UNSPECIFIED;
         
-        socket.join_multicast_v4(&multi_addr, &interface)?;
+        socket.join_multicast_v4(multi_addr, interface)?;
         socket.set_multicast_loop_v4(true)?;
         
         Ok(Self {
@@ -43,7 +42,7 @@ impl DiscoveryService {
         })
     }
 
-    pub async fn start_beacon(&self, join_token: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start_beacon(&self, join_token: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let multi_addr: Ipv4Addr = MULTICAST_GROUP.parse()?;
         let broadcast_addr = SocketAddr::new(IpAddr::V4(multi_addr), MULTICAST_PORT);
         
@@ -71,26 +70,27 @@ pub struct MDNSService {
 }
 
 impl MDNSService {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let service = mdns_sd::ServiceDaemon::new()?;
         Ok(Self { service })
     }
 
-    pub fn advertise(&self, name: &str, port: u16, tls_fingerprint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn advertise(&self, name: &str, port: u16, tls_fingerprint: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let service_type = "_netmon._tcp.local.";
         let hostname = format!("{}.{}", name, service_type);
         
+        let mut txt = std::collections::HashMap::new();
+        txt.insert("v".to_string(), "1".to_string());
+        txt.insert("fp".to_string(), tls_fingerprint.to_string());
+        txt.insert("name".to_string(), name.to_string());
+
         let my_service = mdns_sd::ServiceInfo::new(
             service_type,
             name,
             &hostname,
             "",
             port,
-            Some(vec![
-                format!("v=1"),
-                format!("fp={}", tls_fingerprint),
-                format!("name={}", name),
-            ]),
+            Some(txt),
         )?;
 
         self.service.register(my_service)?;

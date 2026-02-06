@@ -20,7 +20,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
-openssl = { version = "0.10", features = ["vendored"] }
+sha2 = "0.10"
 rcgen = "0.13"
 mdns-sd = "0.11"
 socket2 = "0.5"

@@ -7,10 +7,11 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct AppState {
     pub db: DbPool,
 }
@@ -53,14 +54,12 @@ pub struct HeartbeatRequest {
 pub async fn start_https_server(state: AppState, port: u16) -> Result<String, Box<dyn std::error::Error>> {
     // Generate self-signed certificate
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-    let cert_pem = cert.serialize_pem()?;
-    let key_pem = cert.serialize_private_key_pem();
+    let cert_der = cert.cert.der().to_vec();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
     
     // Calculate fingerprint
-    let fingerprint = openssl::hash::hash(
-        openssl::hash::MessageDigest::sha256(),
-        cert.get_certificate_params().cert.der().as_ref(),
-    )?;
+    let fingerprint = Sha256::digest(&cert_der);
     let fingerprint_hex = hex::encode(fingerprint);
 
     // Save certificate for later use
@@ -75,21 +74,11 @@ pub async fn start_https_server(state: AppState, port: u16) -> Result<String, Bo
         .route("/api/v1/devices/:id", get(get_device))
         .with_state(Arc::new(state));
 
-    let addr = format!("0.0.0.0:{}", port);
-    
-    // Start HTTPS server
-    let rustls_config = axum_server::tls_rustls::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![rustls_pemfile::certs(&mut cert_pem.as_bytes()).unwrap().into_iter().next().unwrap()],
-            rustls_pemfile::pkcs8_private_keys(&mut key_pem.as_bytes()).unwrap().into_iter().next().unwrap().into(),
-        )
-        .unwrap();
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file("certs/cert.pem", "certs/key.pem").await?;
     
     tokio::spawn(async move {
-        axum_server::from_tcp_rustls(listener, rustls_config)
+        axum_server::bind_rustls(addr, rustls_config)
             .serve(app.into_make_service())
             .await
             .unwrap();
@@ -132,7 +121,7 @@ async fn register_device(
     let token_valid: bool = db.conn.query_row(
         "SELECT COUNT(*) FROM tokens WHERE token = ?1 AND expires_at > ?2 AND used = 0",
         [&payload.join_token, &chrono::Utc::now().timestamp().to_string()],
-        |row| row.get(0),
+        |row| row.get::<_, i64>(0),
     ).unwrap_or(0) > 0;
 
     if !token_valid {

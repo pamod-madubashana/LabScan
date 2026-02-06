@@ -71,3 +71,10 @@ export default defineConfig([
   },
 ])
 ```
+
+## Tauri backend build note (Windows MSVC)
+
+The Rust backend in `admin/src-tauri` uses `rustls` + `sha2` and does not depend on OpenSSL.
+
+- Build command: `cargo build` (run from `admin/src-tauri`)
+- No `perl` or OpenSSL/vcpkg setup is required for the current dependency set
