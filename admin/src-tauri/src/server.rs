@@ -470,7 +470,7 @@ impl ServerManager {
         }
     }
 
-    async fn broadcast_only_loop(&self, app: &AppHandle, send_socket: &UdpSocket) {
+    async fn broadcast_only_loop(&self, _app: &AppHandle, send_socket: &UdpSocket) {
         let admin_ip = detect_local_ipv4()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());

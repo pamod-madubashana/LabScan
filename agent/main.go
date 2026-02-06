@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,7 +26,7 @@ const (
 	wsPort           = 8148
 	configPath       = "agent_config.json"
 	agentVersion     = "0.3.0"
-	defaultFakeCount = 4
+	fakeAgentCount   = 4
 )
 
 type PersistedConfig struct {
@@ -111,15 +112,10 @@ type AgentClient struct {
 
 func main() {
 	fake := flag.Bool("fake", false, "Run in fake provisioning mode")
-	fakeCount := flag.Int("fake-count", defaultFakeCount, "Number of fake agents")
 	flag.Parse()
 
-	if *fakeCount <= 0 {
-		*fakeCount = defaultFakeCount
-	}
-
 	if *fake {
-		runFakeMode(*fakeCount)
+		runFakeMode()
 		return
 	}
 
@@ -130,16 +126,6 @@ func runNormalMode() {
 	hostname, _ := os.Hostname()
 	agentID := stableAgentID("")
 
-	if cfg, err := loadConfig(); err == nil && cfg.AdminIP != "" && cfg.Secret != "" {
-		cfg.AgentID = stableAgentID(cfg.AgentID)
-		profile := AgentProfile{AgentID: cfg.AgentID, Hostname: hostname, IPs: localIPv4s(), IsFake: false}
-		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, 8*time.Second)
-		if err := client.runWithFallbackThreshold(5); err == nil {
-			return
-		}
-		log.Printf("Saved config failed, returning to sleep mode")
-	}
-
 	for {
 		cfg, err := waitForProvision(agentID, hostname)
 		if err != nil {
@@ -149,37 +135,48 @@ func runNormalMode() {
 		}
 
 		profile := AgentProfile{AgentID: cfg.AgentID, Hostname: hostname, IPs: localIPv4s(), IsFake: false}
-		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, 8*time.Second)
-		if err := client.runWithFallbackThreshold(5); err != nil {
-			log.Printf("connection dropped after repeated failures: %v", err)
-		}
+		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, jitterDuration(5, 10))
+		_ = client.runWithSleepLifecycle(context.Background())
 	}
 }
 
-func runFakeMode(fakeCount int) {
+func runFakeMode() {
 	hostname, _ := os.Hostname()
 	controllerID := stableAgentID("")
-	cfg, err := waitForProvision(controllerID, hostname)
-	if err != nil {
-		log.Fatalf("failed provisioning in fake mode: %v", err)
-	}
 
-	for i := 1; i <= fakeCount; i++ {
-		profile := AgentProfile{
-			AgentID:  uuid.NewString(),
-			Hostname: fmt.Sprintf("LABSCAN-FAKE-%03d", i),
-			IPs:      []string{fmt.Sprintf("192.168.1.%d", 100+i)},
-			IsFake:   true,
+	for {
+		cfg, err := waitForProvision(controllerID, hostname)
+		if err != nil {
+			log.Printf("failed provisioning in fake mode: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
-		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, jitterDuration(5, 10))
-		go func(c *AgentClient) {
-			_ = c.runWithFallbackThreshold(1000000)
-		}(client)
-	}
+		ctx, cancel := context.WithCancel(context.Background())
+		var doneOnce int32
+		disconnectCh := make(chan struct{}, 1)
 
-	log.Printf("Fake mode: spawned %d agents", fakeCount)
-	select {}
+		for i := 1; i <= fakeAgentCount; i++ {
+			profile := AgentProfile{
+				AgentID:  uuid.NewString(),
+				Hostname: fmt.Sprintf("LABSCAN-FAKE-%03d", i),
+				IPs:      []string{fmt.Sprintf("192.168.1.%d", 100+i)},
+				IsFake:   true,
+			}
+
+			client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, jitterDuration(5, 10))
+			go func(c *AgentClient) {
+				_ = c.runWithSleepLifecycle(ctx)
+				if atomic.CompareAndSwapInt32(&doneOnce, 0, 1) {
+					disconnectCh <- struct{}{}
+				}
+			}(client)
+		}
+
+		log.Printf("Fake mode: spawned 4 agents")
+		<-disconnectCh
+		cancel()
+	}
 }
 
 func waitForProvision(agentID, hostname string) (*PersistedConfig, error) {
@@ -190,7 +187,7 @@ func waitForProvision(agentID, hostname string) (*PersistedConfig, error) {
 	}
 	defer conn.Close()
 
-	log.Printf("Sleep mode: waiting for admin provisioning on UDP %d...", provisionUDPPort)
+	log.Printf("Sleep mode: waiting for admin provisioning on UDP 8870...")
 
 	buffer := make([]byte, 4096)
 	for {
@@ -212,7 +209,7 @@ func waitForProvision(agentID, hostname string) (*PersistedConfig, error) {
 		if provision.Type != "LABSCAN_PROVISION" || provision.V != 1 {
 			continue
 		}
-		if strings.TrimSpace(provision.AdminIP) == "" || strings.TrimSpace(provision.Secret) == "" {
+		if strings.TrimSpace(provision.AdminIP) == "" || strings.TrimSpace(provision.Secret) == "" || strings.TrimSpace(provision.Nonce) == "" {
 			continue
 		}
 
@@ -239,7 +236,7 @@ func waitForProvision(agentID, hostname string) (*PersistedConfig, error) {
 			_, _ = conn.WriteTo(raw, sender)
 		}
 
-		log.Printf("Provisioned by %s:%d, connecting...", senderUDP.IP.String(), senderUDP.Port)
+		log.Printf("Provisioned by %s, connecting to WS 8148...", provision.AdminIP)
 		return cfg, nil
 	}
 }
@@ -251,39 +248,50 @@ func newAgentClient(profile AgentProfile, adminIP, secret string, heartbeat time
 	return &AgentClient{profile: profile, adminIP: adminIP, secret: secret, heartbeat: heartbeat}
 }
 
-func (c *AgentClient) runWithFallbackThreshold(maxConsecutiveFailures int) error {
-	if maxConsecutiveFailures < 1 {
-		maxConsecutiveFailures = 1
-	}
-
-	backoff := time.Second
-	maxBackoff := 20 * time.Second
-	consecutiveFailures := 0
+func (c *AgentClient) runWithSleepLifecycle(ctx context.Context) error {
+	retryDelays := []time.Duration{3 * time.Second, 5 * time.Second, 8 * time.Second}
+	failureCount := 0
 
 	for {
-		registered, err := c.runSession()
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		registered, err := c.runSession(ctx)
 		if err != nil {
 			log.Printf("[%s] session ended: %v", c.profile.Hostname, err)
 		}
 
 		if registered {
-			consecutiveFailures = 0
-		} else {
-			consecutiveFailures++
-			if consecutiveFailures >= maxConsecutiveFailures {
-				return errors.New("too many consecutive connection failures")
-			}
+			failureCount = 0
+			continue
 		}
 
-		time.Sleep(backoff + time.Duration(rand.Intn(400))*time.Millisecond)
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		if failureCount >= len(retryDelays) {
+			log.Printf("Admin offline detected, entering sleep mode...")
+			return errors.New("admin offline")
+		}
+
+		delay := retryDelays[failureCount]
+		failureCount++
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
 		}
 	}
 }
 
-func (c *AgentClient) runSession() (bool, error) {
+func (c *AgentClient) runSession(parent context.Context) (bool, error) {
+	select {
+	case <-parent.Done():
+		return false, parent.Err()
+	default:
+	}
+
 	url := fmt.Sprintf("ws://%s:%d/ws/agent", c.adminIP, wsPort)
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
@@ -292,7 +300,7 @@ func (c *AgentClient) runSession() (bool, error) {
 	defer conn.Close()
 
 	c.conn = conn
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
 	if err := c.send("register", RegisterPayload{
@@ -380,10 +388,7 @@ func (c *AgentClient) readLoop(ctx context.Context, registered chan<- bool) erro
 
 func (c *AgentClient) heartbeatLoop(ctx context.Context) {
 	for {
-		wait := c.heartbeat
-		if c.profile.IsFake {
-			wait = jitterDuration(5, 10)
-		}
+		wait := jitterDuration(5, 10)
 
 		select {
 		case <-ctx.Done():

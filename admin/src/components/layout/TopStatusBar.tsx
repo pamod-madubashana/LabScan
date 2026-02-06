@@ -5,7 +5,7 @@ import { formatSince, useLabScan } from "@/lib/labscan";
 export function TopStatusBar() {
   const { state, ready } = useLabScan();
 
-  const onlineAgents = state.devices.filter((device) => device.status !== "unreachable").length;
+  const onlineAgents = state.devices.filter((device) => device.connected).length;
   const lastLog = state.logs[0];
 
   return (

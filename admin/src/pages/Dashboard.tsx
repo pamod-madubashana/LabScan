@@ -3,53 +3,56 @@ import { MetricCard } from "@/components/dashboard/MetricCard";
 import { ActivityFeed } from "@/components/dashboard/ActivityFeed";
 import { SystemHealth } from "@/components/dashboard/SystemHealth";
 import { ThreatSummary } from "@/components/dashboard/ThreatSummary";
+import { useLabScan } from "@/lib/labscan";
 
 const Dashboard = () => {
+  const { state } = useLabScan();
+
+  const online = state.devices.filter((device) => device.connected).length;
+  const offline = state.devices.filter((device) => !device.connected).length;
+  const recentError = state.logs.find((entry) => entry.level === "ERROR");
+
   return (
     <div className="p-5 space-y-5">
-      {/* Metric cards */}
       <div className="grid grid-cols-4 gap-4">
         <MetricCard
           label="Active Clients"
-          value={24}
+          value={online}
           icon={Monitor}
-          trend="+2 today"
+          trend={state.server.online ? "live" : "server offline"}
           status="cyan"
           delay={0}
         />
         <MetricCard
           label="Offline Clients"
-          value={6}
+          value={offline}
           icon={MonitorOff}
-          trend="—"
+          trend={state.devices.length === 0 ? "no devices" : undefined}
           status="amber"
           delay={0.05}
         />
         <MetricCard
-          label="Avg Latency"
-          value="12ms"
+          label="Running Tasks"
+          value={state.tasks.filter((task) => task.status === "running").length}
           icon={Gauge}
-          trend="↓ 3ms"
+          trend={`${state.tasks.length} total`}
           status="green"
           delay={0.1}
         />
         <MetricCard
           label="Active Alerts"
-          value={3}
+          value={state.logs.filter((entry) => entry.level === "ERROR").length}
           icon={AlertTriangle}
-          trend="+1 new"
+          trend={recentError ? "error events detected" : "none"}
           status="red"
           delay={0.15}
         />
       </div>
 
-      {/* Main grid */}
       <div className="grid grid-cols-3 gap-4">
-        {/* Activity feed - takes 2 cols */}
         <div className="col-span-2">
           <ActivityFeed />
         </div>
-        {/* Right column */}
         <div className="space-y-4">
           <SystemHealth />
           <ThreatSummary />
