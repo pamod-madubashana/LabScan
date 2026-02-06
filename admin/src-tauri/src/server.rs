@@ -102,7 +102,7 @@ pub async fn generate_token(state: AppState, duration_minutes: u32) -> Result<St
     let now = chrono::Utc::now().timestamp();
     let expires = now + (duration_minutes as i64 * 60);
     
-    let mut db = state.db.lock().await;
+    let db = state.db.lock().await;
     db.conn.execute(
         "INSERT INTO tokens (token, created_at, expires_at) VALUES (?1, ?2, ?3)",
         [&token, &now.to_string(), &expires.to_string()],
@@ -198,9 +198,9 @@ async fn list_devices(
 
 async fn get_device(
     State(state): State<Arc<AppState>>,
-    Path(device_id): Path<String>,
+    Path(_device_id): Path<String>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().await;
+    let _db = state.db.lock().await;
     // Implementation for getting single device details
     (StatusCode::NOT_IMPLEMENTED, "Not implemented").into_response()
 }
