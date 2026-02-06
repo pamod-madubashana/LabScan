@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,19 +18,19 @@ const (
 )
 
 type Config struct {
-	AdminURL     string `json:"admin_url"`
-	JoinToken    string `json:"join_token"`
-	DeviceID     string `json:"device_id"`
+	AdminURL       string `json:"admin_url"`
+	JoinToken      string `json:"join_token"`
+	DeviceID       string `json:"device_id"`
 	TLSFingerprint string `json:"tls_fingerprint"`
 }
 
 type BeaconPayload struct {
-	Type               string `json:"type"`
-	Version            string `json:"version"`
-	AdminHTTPSURL      string `json:"admin_https_url"`
+	Type                 string `json:"type"`
+	Version              string `json:"version"`
+	AdminHTTPSURL        string `json:"admin_https_url"`
 	TLSFingerprintSHA256 string `json:"tls_fingerprint_sha256"`
-	JoinToken          string `json:"join_token"`
-	IssuedAtUnix       int64  `json:"issued_at_unix"`
+	JoinToken            string `json:"join_token"`
+	IssuedAtUnix         int64  `json:"issued_at_unix"`
 }
 
 type DeviceInfo struct {
@@ -84,7 +82,7 @@ func main() {
 
 func loadOrCreateConfig(path, adminURL, joinToken string) (*Config, error) {
 	config := &Config{}
-	
+
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		// Create new config
 		config.DeviceID = uuid.New().String()
@@ -124,7 +122,7 @@ func saveConfig(path string, config *Config) error {
 
 func discoverAndRegister(config *Config, configPath string) error {
 	log.Println("Listening for admin beacon...")
-	
+
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", multicastGroup, multicastPort))
 	if err != nil {
 		return fmt.Errorf("failed to resolve address: %v", err)
@@ -155,12 +153,12 @@ func discoverAndRegister(config *Config, configPath string) error {
 	}
 
 	log.Printf("Discovered admin at %s", beacon.AdminHTTPSURL)
-	
+
 	// Store admin info
 	config.AdminURL = beacon.AdminHTTPSURL
 	config.JoinToken = beacon.JoinToken
 	config.TLSFingerprint = beacon.TLSFingerprintSHA256
-	
+
 	err = saveConfig(configPath, config)
 	if err != nil {
 		return fmt.Errorf("failed to save config: %v", err)
@@ -174,14 +172,14 @@ func discoverAndRegister(config *Config, configPath string) error {
 	}
 
 	// TODO: Implement HTTPS registration
-	log.Printf("Would register device: %+v", deviceInfo)
-	
+	log.Printf("Would register request: %+v", registerReq)
+
 	return nil
 }
 
 func getDeviceInfo() DeviceInfo {
 	hostname, _ := os.Hostname()
-	
+
 	localIP := getLocalIP()
 	macAddr := getMacAddress()
 	gateway := getGateway()
@@ -205,7 +203,7 @@ func getLocalIP() string {
 		return "127.0.0.1"
 	}
 	defer conn.Close()
-	
+
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	return localAddr.IP.String()
 }
@@ -216,7 +214,7 @@ func getMacAddress() *string {
 	if err != nil {
 		return nil
 	}
-	
+
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp != 0 && len(iface.HardwareAddr) > 0 {
 			mac := iface.HardwareAddr.String()
@@ -287,7 +285,7 @@ func checkHTTPS() *int64 {
 		return nil
 	}
 	defer conn.Close()
-	
+
 	duration := time.Since(start).Milliseconds()
 	return &duration
 }
