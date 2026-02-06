@@ -1,68 +1,174 @@
-:root {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap');
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-a:hover {
-  color: #535bf2;
-}
-
-body {
-  margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
-}
-
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
-}
-
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  background-color: #1a1a1a;
-  cursor: pointer;
-  transition: border-color 0.25s;
-}
-button:hover {
-  border-color: #646cff;
-}
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
-}
-
-@media (prefers-color-scheme: light) {
+@layer base {
   :root {
-    color: #213547;
-    background-color: #ffffff;
+    /* LabScan Cyber-Ops Dark Theme */
+    --background: 220 25% 6%;
+    --foreground: 210 20% 88%;
+
+    --card: 220 22% 10%;
+    --card-foreground: 210 20% 88%;
+
+    --popover: 220 22% 10%;
+    --popover-foreground: 210 20% 88%;
+
+    /* Electric Cyan */
+    --primary: 190 95% 45%;
+    --primary-foreground: 220 25% 6%;
+
+    /* Deep slate */
+    --secondary: 220 18% 14%;
+    --secondary-foreground: 210 20% 80%;
+
+    --muted: 220 15% 13%;
+    --muted-foreground: 215 15% 50%;
+
+    --accent: 220 18% 16%;
+    --accent-foreground: 210 20% 88%;
+
+    /* Red for critical */
+    --destructive: 0 75% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 15% 16%;
+    --input: 220 15% 14%;
+    --ring: 190 95% 45%;
+
+    --radius: 0.5rem;
+
+    /* Custom tokens */
+    --cyan: 190 95% 45%;
+    --cyan-glow: 190 100% 55%;
+    --green: 155 75% 45%;
+    --green-glow: 155 85% 55%;
+    --amber: 40 90% 55%;
+    --amber-glow: 40 95% 65%;
+    --red: 0 75% 55%;
+    --red-glow: 0 85% 65%;
+
+    /* Glass effect */
+    --glass-bg: 220 25% 10% / 0.6;
+    --glass-border: 220 20% 20% / 0.4;
+
+    /* Sidebar */
+    --sidebar-background: 220 25% 7%;
+    --sidebar-foreground: 210 15% 60%;
+    --sidebar-primary: 190 95% 45%;
+    --sidebar-primary-foreground: 220 25% 6%;
+    --sidebar-accent: 220 20% 12%;
+    --sidebar-accent-foreground: 210 20% 88%;
+    --sidebar-border: 220 15% 14%;
+    --sidebar-ring: 190 95% 45%;
   }
-  a:hover {
-    color: #747bff;
+}
+
+@layer base {
+  * {
+    @apply border-border;
   }
-  button {
-    background-color: #f9f9f9;
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }
+
+  code, .font-mono {
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  }
+}
+
+@layer utilities {
+  /* Glass panel effect */
+  .glass-panel {
+    @apply bg-card/60 backdrop-blur-xl border border-white/[0.06] rounded-lg;
+  }
+
+  /* Glow effects */
+  .glow-cyan {
+    box-shadow: 0 0 12px hsl(190 95% 45% / 0.25), 0 0 4px hsl(190 95% 45% / 0.15);
+  }
+  .glow-green {
+    box-shadow: 0 0 12px hsl(155 75% 45% / 0.25), 0 0 4px hsl(155 75% 45% / 0.15);
+  }
+  .glow-amber {
+    box-shadow: 0 0 12px hsl(40 90% 55% / 0.25), 0 0 4px hsl(40 90% 55% / 0.15);
+  }
+  .glow-red {
+    box-shadow: 0 0 12px hsl(0 75% 55% / 0.25), 0 0 4px hsl(0 75% 55% / 0.15);
+  }
+
+  /* Subtle grid background */
+  .grid-bg {
+    background-image:
+      linear-gradient(hsl(220 15% 16% / 0.3) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(220 15% 16% / 0.3) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  /* Noise texture overlay */
+  .noise-overlay {
+    position: relative;
+  }
+  .noise-overlay::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    opacity: 0.015;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Status dot animation */
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.6; transform: scale(1.3); }
+  }
+  .pulse-dot {
+    animation: pulse-dot 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* Scan line animation */
+  @keyframes scan-line {
+    0% { transform: translateY(-100%); }
+    100% { transform: translateY(100%); }
+  }
+
+  /* Subtle float animation */
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-2px); }
+  }
+  .animate-float {
+    animation: float 3s ease-in-out infinite;
+  }
+
+  /* Active sidebar indicator */
+  .sidebar-active-bar {
+    @apply relative;
+  }
+  .sidebar-active-bar::before {
+    content: '';
+    @apply absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-6 rounded-r-full;
+    background: hsl(190 95% 45%);
+    box-shadow: 0 0 8px hsl(190 95% 45% / 0.5);
+  }
+
+  /* Scrollbar styling */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-white/10 rounded-full;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    @apply bg-white/20;
   }
 }
