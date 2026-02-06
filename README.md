@@ -1,6 +1,10 @@
-# LabScan - University LAN Monitoring Prototype
+<div align="center">
+  <h1>LabScan</h1>
+  <img src="admin/src-tauri/icons/icon.png" alt="LabScan network topology" width="360" />
+  <p>Zero-config LAN monitoring with a Tauri admin dashboard and lightweight Go client agents.</p>
+</div>
 
-A zero-config LAN monitoring system with Tauri admin dashboard and Go client agents.
+# LabScan - University LAN Monitoring Prototype
 
 ## Architecture
 
