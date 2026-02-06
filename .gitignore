@@ -10,8 +10,6 @@
 /agent/bin/
 /agent/labscan-agent
 /agent/labscan-agent.exe
-/agent/go.mod
-/agent/go.sum
 
 # Certificates and database
 /certs/
