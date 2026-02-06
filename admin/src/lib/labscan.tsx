@@ -1,6 +1,7 @@
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { logger } from "@/lib/logger";
 
 type DeviceStatus = "online" | "idle" | "scanning" | "offline" | "unreachable";
 
@@ -105,14 +106,29 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           tasks: tasksSnapshot.tasks,
           logs: [],
         });
+        void logger.info("[UI] startup snapshots loaded", {
+          online: server.online,
+          devices: devicesSnapshot.devices.length,
+          tasks: tasksSnapshot.tasks.length,
+        });
 
         const unlistenServer = await listen<ServerStatus>("server_status", (event) => {
+          void logger.info("[UI] server_status", {
+            online: event.payload.online,
+            port_ws: event.payload.port_ws,
+            port_udp: event.payload.port_udp,
+          });
           setState((prev) => ({ ...prev, server: event.payload }));
         });
         const unlistenDevices = await listen<{ devices: DeviceRecord[] }>("devices_snapshot", (event) => {
+          void logger.info("[UI] devices_snapshot", { count: event.payload.devices.length });
           setState((prev) => ({ ...prev, devices: event.payload.devices }));
         });
         const unlistenDeviceUpsert = await listen<{ device: DeviceRecord }>("device_upsert", (event) => {
+          void logger.info("[UI] device_upsert", {
+            id: event.payload.device.agent_id,
+            status: event.payload.device.status,
+          });
           setState((prev) => {
             const map = new Map(prev.devices.map((device) => [device.agent_id, device]));
             map.set(event.payload.device.agent_id, event.payload.device);
@@ -120,6 +136,7 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           });
         });
         const unlistenDeviceRemove = await listen<{ agent_id: string }>("device_remove", (event) => {
+          void logger.info("[UI] device_remove", { id: event.payload.agent_id });
           setState((prev) => ({
             ...prev,
             devices: prev.devices.filter((device) => device.agent_id !== event.payload.agent_id),
@@ -139,6 +156,10 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           }));
         });
 
+        void logger.info("[UI] subscribed events", {
+          events: ["server_status", "devices_snapshot", "device_upsert", "device_remove", "task_update", "log_event"],
+        });
+
         unsubscribers = [
           unlistenServer,
           unlistenDevices,
@@ -148,6 +169,7 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           unlistenLog,
         ];
       } catch (err) {
+        void logger.error("[UI] backend initialization failed", { error: err instanceof Error ? err.message : String(err) });
         setError(err instanceof Error ? err.message : "failed to initialize LabScan runtime");
         setState(defaultState);
       } finally {

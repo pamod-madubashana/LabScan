@@ -293,10 +293,13 @@ func (c *AgentClient) runSession(parent context.Context) (bool, error) {
 	}
 
 	url := fmt.Sprintf("ws://%s:%d/ws/agent", c.adminIP, wsPort)
+	log.Printf("WS dial url=%s", url)
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
+		log.Printf("WS dial failed err=%v", err)
 		return false, fmt.Errorf("dial failed: %w", err)
 	}
+	log.Printf("WS connected agent_id=%s", c.profile.AgentID)
 	defer conn.Close()
 
 	c.conn = conn
@@ -324,16 +327,24 @@ func (c *AgentClient) runSession(parent context.Context) (bool, error) {
 	select {
 	case ok := <-registered:
 		if !ok {
+			log.Printf("WS register rejected agent_id=%s", c.profile.AgentID)
 			return false, errors.New("registration rejected")
 		}
+		log.Printf("WS register accepted agent_id=%s", c.profile.AgentID)
 	case err := <-errCh:
+		log.Printf("WS closed err=%v -> entering sleep", err)
 		return false, err
 	case <-time.After(10 * time.Second):
+		log.Printf("WS register timeout agent_id=%s", c.profile.AgentID)
 		return false, errors.New("register timeout")
 	}
 
 	go c.heartbeatLoop(ctx)
-	return true, <-errCh
+	err = <-errCh
+	if err != nil {
+		log.Printf("WS closed err=%v -> entering sleep", err)
+	}
+	return true, err
 }
 
 func (c *AgentClient) readLoop(ctx context.Context, registered chan<- bool) error {
@@ -359,6 +370,7 @@ func (c *AgentClient) readLoop(ctx context.Context, registered chan<- bool) erro
 			if err := json.Unmarshal(message.Payload, &payload); err != nil {
 				continue
 			}
+			log.Printf("WS registered response agent_id=%s ok=%v", c.profile.AgentID, payload.OK)
 			if !registeredSent {
 				registered <- payload.OK
 				registeredSent = true

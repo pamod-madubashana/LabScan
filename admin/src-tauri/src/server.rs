@@ -1,5 +1,6 @@
 use axum::{
     extract::{
+        ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
+    net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
@@ -327,9 +329,19 @@ impl ServerManager {
 
     async fn run_ws_server(&self, app: AppHandle) {
         let bind_addr = format!("0.0.0.0:{}", WS_PORT);
+        tracing::info!("[WS] binding addr={}", bind_addr);
+        self.emit_log(
+            &app,
+            None,
+            "INFO",
+            format!("Starting WS server on {}", bind_addr),
+        )
+        .await;
+
         let listener = match TcpListener::bind(&bind_addr).await {
             Ok(listener) => listener,
             Err(err) => {
+                tracing::error!("[WS] bind failed addr={} err={}", bind_addr, err);
                 self.set_online(&app, false).await;
                 self.emit_log(
                     &app,
@@ -343,6 +355,7 @@ impl ServerManager {
         };
 
         self.set_online(&app, true).await;
+        tracing::info!("[WS] listening addr={}", bind_addr);
         self.emit_log(
             &app,
             None,
@@ -356,8 +369,9 @@ impl ServerManager {
             app: app.clone(),
         });
 
-        if let Err(err) = axum::serve(listener, router).await {
+        if let Err(err) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
             self.set_online(&app, false).await;
+            tracing::error!("[WS] server stopped err={}", err);
             self.emit_log(
                 &app,
                 None,
@@ -414,6 +428,20 @@ impl ServerManager {
             .unwrap_or_else(|| "127.0.0.1".to_string());
         let destination = format!("255.255.255.255:{}", UDP_PORT);
         let mut ack_buffer = [0_u8; 2048];
+
+        tracing::info!(
+            "[PROVISION] broadcasting udp_port={} admin_ip={} destination={}",
+            UDP_PORT,
+            admin_ip,
+            destination
+        );
+        self.emit_log(
+            &app,
+            None,
+            "INFO",
+            format!("provision: broadcasting on UDP {}, admin_ip={}", UDP_PORT, admin_ip),
+        )
+        .await;
 
         loop {
             let is_online = {
@@ -475,6 +503,12 @@ impl ServerManager {
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());
         let destination = format!("255.255.255.255:{}", UDP_PORT);
+        tracing::info!(
+            "[PROVISION] broadcast-only mode udp_port={} admin_ip={} destination={}",
+            UDP_PORT,
+            admin_ip,
+            destination
+        );
 
         loop {
             let is_online = {
@@ -662,11 +696,26 @@ impl ServerManager {
     }
 }
 
-async fn ws_agent_handler(ws: WebSocketUpgrade, State(state): State<HttpState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_agent_socket(socket, state))
+async fn ws_agent_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    State(state): State<HttpState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_agent_socket(socket, state, remote))
 }
 
-async fn handle_agent_socket(socket: WebSocket, state: HttpState) {
+async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: SocketAddr) {
+    tracing::info!("[WS] connect remote={} path=/ws/agent", remote);
+    state
+        .manager
+        .emit_log(
+            &state.app,
+            None,
+            "INFO",
+            format!("[WS] connect remote={} path=/ws/agent", remote),
+        )
+        .await;
+
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let write_task = tokio::spawn(async move {
@@ -682,7 +731,19 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState) {
     while let Some(incoming) = receiver.next().await {
         let message = match incoming {
             Ok(message) => message,
-            Err(_) => break,
+            Err(err) => {
+                tracing::warn!("[WS] receive error remote={} err={}", remote, err);
+                state
+                    .manager
+                    .emit_log(
+                        &state.app,
+                        registered_agent_id.clone(),
+                        "WARN",
+                        format!("[WS] receive error remote={} err={}", remote, err),
+                    )
+                    .await;
+                break;
+            }
         };
 
         let text = match message {
@@ -696,16 +757,53 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState) {
             Err(_) => continue,
         };
 
+        tracing::info!(
+            "[WS] message remote={} type={} agent_id={}",
+            remote,
+            incoming.message_type,
+            incoming.agent_id
+        );
+
         if incoming.message_type == "register" {
             let payload = match serde_json::from_value::<RegisterPayload>(incoming.payload) {
                 Ok(payload) => payload,
-                Err(_) => continue,
+                Err(err) => {
+                    tracing::warn!("[WS] register parse failed remote={} err={}", remote, err);
+                    state
+                        .manager
+                        .emit_log(
+                            &state.app,
+                            None,
+                            "WARN",
+                            format!("[WS] register parse failed remote={} err={}", remote, err),
+                        )
+                        .await;
+                    continue;
+                }
             };
 
             let secret_ok = {
                 let guard = state.manager.inner.lock().await;
                 payload.secret == guard.pair_token
             };
+
+            tracing::info!(
+                "[WS] message type=register agent_id={} ok={}",
+                payload.agent_id,
+                secret_ok
+            );
+            state
+                .manager
+                .emit_log(
+                    &state.app,
+                    Some(payload.agent_id.clone()),
+                    if secret_ok { "INFO" } else { "WARN" },
+                    format!(
+                        "[WS] message type=register agent_id={} ok={}",
+                        payload.agent_id, secret_ok
+                    ),
+                )
+                .await;
 
             let registered = if secret_ok {
                 json!({"ok": true})
@@ -746,6 +844,8 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState) {
                 guard.devices.insert(payload.agent_id.clone(), device.clone());
             }
 
+            tracing::info!("[WS] agent upserted agent_id={}", payload.agent_id);
+
             registered_agent_id = Some(payload.agent_id.clone());
             state.manager.emit_device_upsert(&state.app, device).await;
             state
@@ -768,6 +868,17 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState) {
         match incoming.message_type.as_str() {
             "heartbeat" => {
                 if let Ok(payload) = serde_json::from_value::<HeartbeatPayload>(incoming.payload) {
+                    tracing::info!("[WS] heartbeat agent_id={}", agent_id);
+                    state
+                        .manager
+                        .emit_log(
+                            &state.app,
+                            Some(agent_id.clone()),
+                            "DEBUG",
+                            format!("[WS] heartbeat agent_id={}", agent_id),
+                        )
+                        .await;
+
                     let maybe_device = {
                         let mut guard = state.manager.inner.lock().await;
                         if let Some(device) = guard.devices.get_mut(&agent_id) {
@@ -837,7 +948,19 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState) {
 
     write_task.abort();
     if let Some(agent_id) = registered_agent_id {
+        tracing::info!("[WS] disconnect agent_id={}", agent_id);
+        state
+            .manager
+            .emit_log(
+                &state.app,
+                Some(agent_id.clone()),
+                "INFO",
+                format!("[WS] disconnect agent_id={}", agent_id),
+            )
+            .await;
         state.manager.on_agent_disconnect(&state.app, agent_id).await;
+    } else {
+        tracing::info!("[WS] disconnect remote={} agent_id=unknown", remote);
     }
 }
 
