@@ -34,9 +34,8 @@ jobs:
           cache: false
       
       - name: Build Go Agent
-        run: |
-          cd agent
-          go build -o labscan-agent.exe .
+        working-directory: agent
+        run: go build -o labscan-agent.exe .
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -44,21 +43,17 @@ jobs:
           workspaces: './admin/src-tauri -> target'
 
       - name: Install frontend dependencies
-        run: |
-          cd ..
-          cd admin
-          npm install
+        working-directory: admin
+        run: npm install
 
       - name: Install Tauri CLI
-        run: |
-          cd admin
-          npm install -g @tauri-apps/cli
+        working-directory: admin
+        run: npm install -g @tauri-apps/cli
       
 
       - name: Build Tauri app
-        run: |
-          cd admin
-          npm run tauri build
+        working-directory: admin
+        run: npm run tauri build
         env:
           TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
