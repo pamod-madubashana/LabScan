@@ -53,6 +53,7 @@ labscan-agent.exe -admin-url ws://<ADMIN_IP>:8787/ws/agent -secret labscan-dev-s
 ## Current scope
 
 - In-memory runtime state (devices, tasks, logs, connections)
+- Network map is gateway-based by default; advanced switch discovery requires explicit SNMP/manual mapping
 - Realtime UI updates via Tauri events (`labscan://state`)
 - Agent reconnect with bounded exponential backoff
 - No remote command execution (by design)

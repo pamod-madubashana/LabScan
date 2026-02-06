@@ -1,123 +1,168 @@
 import { useMemo, useRef, useState } from "react";
-import ReactFlow, {
-  Background,
-  Controls,
-  MiniMap,
-  type Edge,
-  type Node,
-  type NodeTypes,
-} from "reactflow";
+import ReactFlow, { Background, Controls, MiniMap, type Edge, type Node, type NodeTypes } from "reactflow";
 import "reactflow/dist/style.css";
-import { formatSince, useLabScan, type DeviceRecord } from "@/lib/labscan";
+import { formatSince, useLabScan } from "@/lib/labscan";
 import { LabscanNode } from "./LabscanNode";
 
 const nodeTypes: NodeTypes = {
   labscanNode: LabscanNode,
 };
 
-function ipNum(ip?: string): number | null {
+function ipToNumber(ip?: string | null): number | null {
   if (!ip) return null;
   const parts = ip.split(".").map((part) => Number(part));
   if (parts.length !== 4 || parts.some((part) => Number.isNaN(part) || part < 0 || part > 255)) return null;
   return (((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
 }
 
-function compareByNumericIp(a: DeviceRecord, b: DeviceRecord): number {
-  const aVal = ipNum(a.ips[0]);
-  const bVal = ipNum(b.ips[0]);
-  if (aVal === null && bVal !== null) return 1;
-  if (aVal !== null && bVal === null) return -1;
-  if (aVal !== null && bVal !== null && aVal !== bVal) return aVal - bVal;
-  const hostCmp = a.hostname.localeCompare(b.hostname);
-  if (hostCmp !== 0) return hostCmp;
-  return a.agent_id.localeCompare(b.agent_id);
+function compareNodeIdsByIpLike(a: string, b: string): number {
+  const aIp = a.startsWith("gw:") ? a.slice(3) : null;
+  const bIp = b.startsWith("gw:") ? b.slice(3) : null;
+  const aNum = ipToNumber(aIp ?? a);
+  const bNum = ipToNumber(bIp ?? b);
+  if (aNum === null && bNum !== null) return 1;
+  if (aNum !== null && bNum === null) return -1;
+  if (aNum !== null && bNum !== null && aNum !== bNum) return aNum - bNum;
+  return a.localeCompare(b);
 }
 
 export function NetworkMapFlow() {
   const { state, focusedAgentId, setFocusedAgentId } = useLabScan();
   const [hoveredId, setHoveredId] = useState<string | undefined>();
 
-  const sortedDevices = useMemo(() => [...state.devices].sort(compareByNumericIp), [state.devices]);
-  const topologyKey = useMemo(() => sortedDevices.map((d) => d.agent_id).join("|"), [sortedDevices]);
+  const devicesByAgent = useMemo(() => new Map(state.devices.map((d) => [d.agent_id, d])), [state.devices]);
+  const topology = state.topology;
+  const topologyKey = `rev:${topology.revision}`;
 
   const positionsRef = useRef<Record<string, { x: number; y: number }>>({});
   const lastTopologyKeyRef = useRef("");
 
   if (lastTopologyKeyRef.current !== topologyKey) {
-    const nextPositions: Record<string, { x: number; y: number }> = { admin: { x: 360, y: 250 } };
-    const radius = 220;
-    sortedDevices.forEach((device, index) => {
-      const angle = (Math.PI * 2 * index) / Math.max(1, sortedDevices.length) - Math.PI / 2;
-      nextPositions[device.agent_id] = {
-        x: 360 + Math.cos(angle) * radius,
-        y: 250 + Math.sin(angle) * radius,
-      };
+    const nextPositions: Record<string, { x: number; y: number }> = {};
+    const nodesById = new Map(topology.nodes.map((node) => [node.id, node]));
+    const childrenByParent = new Map<string, string[]>();
+    for (const edge of topology.edges) {
+      const list = childrenByParent.get(edge.parent_id) ?? [];
+      list.push(edge.child_id);
+      childrenByParent.set(edge.parent_id, list);
+    }
+
+    const gateways = topology.nodes
+      .filter((node) => node.node_type === "gateway")
+      .map((node) => node.id)
+      .sort(compareNodeIdsByIpLike);
+
+    const colCount = Math.max(1, Math.ceil(Math.sqrt(gateways.length || 1)));
+    gateways.forEach((gatewayId, index) => {
+      const col = index % colCount;
+      const row = Math.floor(index / colCount);
+      nextPositions[gatewayId] = { x: 340 + col * 520, y: 280 + row * 420 };
     });
+
+    const subnetIds = topology.nodes
+      .filter((node) => node.node_type === "subnet")
+      .map((node) => node.id)
+      .sort((a, b) => a.localeCompare(b));
+    subnetIds.forEach((subnetId, i) => {
+      nextPositions[subnetId] = { x: 110 + i * 520, y: 70 };
+    });
+
+    const fallbackParent = gateways[0];
+    for (const node of topology.nodes) {
+      if (node.node_type === "admin") {
+        const parentId = topology.edges.find((edge) => edge.child_id === node.id)?.parent_id ?? fallbackParent;
+        const parentPos = (parentId && nextPositions[parentId]) || { x: 340, y: 280 };
+        nextPositions[node.id] = { x: parentPos.x - 170, y: parentPos.y - 135 };
+      }
+    }
+
+    for (const parentId of [...gateways, ...topology.nodes.filter((n) => n.node_type === "unknown_hub" || n.node_type === "switch").map((n) => n.id)]) {
+      if (!nextPositions[parentId]) {
+        const parentNode = nodesById.get(parentId);
+        const gwParent = topology.edges.find((edge) => edge.child_id === parentId)?.parent_id;
+        const anchor = gwParent ? nextPositions[gwParent] : undefined;
+        nextPositions[parentId] = anchor ? { x: anchor.x + 130, y: anchor.y + 120 } : { x: 500, y: 360 };
+        if (parentNode?.node_type === "unknown_hub") {
+          nextPositions[parentId] = { x: nextPositions[parentId].x + 80, y: nextPositions[parentId].y + 50 };
+        }
+      }
+
+      const children = (childrenByParent.get(parentId) ?? [])
+        .filter((childId) => nodesById.get(childId)?.node_type === "host")
+        .sort((a, b) => {
+          const aAgent = nodesById.get(a)?.agent_id;
+          const bAgent = nodesById.get(b)?.agent_id;
+          const aIp = aAgent ? devicesByAgent.get(aAgent)?.ip ?? devicesByAgent.get(aAgent)?.ips[0] : undefined;
+          const bIp = bAgent ? devicesByAgent.get(bAgent)?.ip ?? devicesByAgent.get(bAgent)?.ips[0] : undefined;
+          const aNum = ipToNumber(aIp);
+          const bNum = ipToNumber(bIp);
+          if (aNum === null && bNum !== null) return 1;
+          if (aNum !== null && bNum === null) return -1;
+          if (aNum !== null && bNum !== null && aNum !== bNum) return aNum - bNum;
+          return a.localeCompare(b);
+        });
+
+      const center = nextPositions[parentId];
+      const radius = parentId.startsWith("gw:") ? 230 : 120;
+      children.forEach((childId, idx) => {
+        const angle = (Math.PI * 2 * idx) / Math.max(1, children.length) - Math.PI / 2;
+        nextPositions[childId] = {
+          x: center.x + Math.cos(angle) * radius,
+          y: center.y + Math.sin(angle) * radius,
+        };
+      });
+    }
+
     positionsRef.current = nextPositions;
     lastTopologyKeyRef.current = topologyKey;
   }
 
   const nodes: Node[] = useMemo(() => {
-    const base: Node[] = [
-      {
-        id: "admin",
-        type: "labscanNode",
-        position: positionsRef.current.admin ?? { x: 360, y: 250 },
-        data: {
-          label: "LabScan Admin",
-          isAdmin: true,
-          selected: focusedAgentId === "admin",
-          onHover: setHoveredId,
-          onSelect: setFocusedAgentId,
-        },
-      },
-    ];
-
-    sortedDevices.forEach((device) => {
-      base.push({
-        id: device.agent_id,
-        type: "labscanNode",
-        position: positionsRef.current[device.agent_id] ?? { x: 360, y: 250 },
-        data: {
-          label: device.hostname,
-          ip: device.ips[0],
-          status: device.status,
-          internet: device.internet_reachable,
-          dns: device.dns_ok,
-          selected: focusedAgentId === device.agent_id,
-          onHover: setHoveredId,
-          onSelect: setFocusedAgentId,
-        },
-      });
-    });
-
-    return base;
-  }, [sortedDevices, focusedAgentId, setFocusedAgentId]);
-
-  const edges: Edge[] = useMemo(() => {
-    return sortedDevices.map((device) => {
-      const isConnectedToHover = hoveredId === device.agent_id;
-      const highlighted = isConnectedToHover || focusedAgentId === device.agent_id;
-
-      const strokeOpacity = highlighted ? 0.95 : 0.72;
-      const strokeWidth = highlighted ? 2.8 : 2.2;
-
+    return topology.nodes.map((node) => {
+      const device = node.agent_id ? devicesByAgent.get(node.agent_id) : undefined;
       return {
-        id: `admin-${device.agent_id}`,
-        source: "admin",
-        target: device.agent_id,
-        type: "smoothstep",
-        animated: false,
-        style: {
-          stroke: highlighted ? "#38bdf8" : "#334155",
-          strokeOpacity,
-          strokeWidth,
+        id: node.id,
+        type: "labscanNode",
+        position: positionsRef.current[node.id] ?? { x: 400, y: 300 },
+        data: {
+          label: node.label,
+          nodeType: node.node_type,
+          ip: device?.ip ?? device?.ips[0] ?? node.gateway_ip,
+          status: device?.status,
+          internet: device?.internet_reachable,
+          dns: device?.dns_ok,
+          interfaceType: device?.interface_type ?? node.interface_type,
+          subnet: device?.subnet_cidr ?? node.subnet_cidr,
+          lastSeenMs: device?.last_seen_ms,
+          attachedCount: node.attached_count,
+          selected: focusedAgentId === (node.agent_id ?? node.id),
+          onHover: setHoveredId,
+          onSelect: (id: string) => setFocusedAgentId(node.agent_id ?? id),
         },
       };
     });
-  }, [sortedDevices, hoveredId, focusedAgentId]);
+  }, [topology.nodes, devicesByAgent, focusedAgentId, setFocusedAgentId]);
 
-  const hoveredDevice = state.devices.find((device) => device.agent_id === hoveredId);
+  const edges: Edge[] = useMemo(() => {
+    return topology.edges.map((edge) => {
+      const highlighted = hoveredId === edge.child_id || hoveredId === edge.parent_id;
+      return {
+        id: edge.id,
+        source: edge.child_id,
+        target: edge.parent_id,
+        type: "smoothstep",
+        animated: false,
+        style: {
+          stroke: edge.method === "heuristic" ? "#f59e0b" : highlighted ? "#38bdf8" : "#334155",
+          strokeOpacity: highlighted ? 0.95 : 0.72,
+          strokeWidth: highlighted ? 2.8 : 2.2,
+        },
+      };
+    });
+  }, [topology.edges, hoveredId]);
+
+  const hoveredNode = hoveredId ? topology.nodes.find((node) => node.id === hoveredId) : undefined;
+  const hoveredDevice = hoveredNode?.agent_id ? devicesByAgent.get(hoveredNode.agent_id) : undefined;
 
   return (
     <div className="relative h-full min-h-[520px] w-full rounded-lg border border-border/50 bg-card/40 overflow-hidden">
@@ -132,30 +177,30 @@ export function NetworkMapFlow() {
         elementsSelectable
         panOnDrag
         zoomOnScroll
-        minZoom={0.5}
-        maxZoom={1.6}
+        minZoom={0.35}
+        maxZoom={1.75}
         className="bg-transparent labscan-map"
       >
         <Background variant={1} gap={24} size={1.1} color="rgba(148,163,184,0.20)" />
-        <MiniMap
-          pannable
-          zoomable
-          nodeStrokeWidth={2}
-          className="!bg-card/80 !border !border-border/60 !rounded-md"
-          maskColor="rgba(2,6,23,0.65)"
-        />
+        <MiniMap pannable zoomable nodeStrokeWidth={2} className="!bg-card/80 !border !border-border/60 !rounded-md" maskColor="rgba(2,6,23,0.65)" />
         <Controls className="!bg-card/80 !border !border-border/60 !rounded-md" showInteractive={false} />
       </ReactFlow>
 
-      {hoveredDevice && (
-        <div className="absolute right-4 top-4 w-64 glass-panel p-3 text-xs">
-          <p className="text-foreground font-semibold">{hoveredDevice.hostname}</p>
-          <p className="text-muted-foreground font-mono mt-0.5">{hoveredDevice.ips[0] ?? "-"}</p>
+      {hoveredNode && (
+        <div className="absolute right-4 top-4 w-72 glass-panel p-3 text-xs">
+          <p className="text-foreground font-semibold">{hoveredNode.label}</p>
+          <p className="text-muted-foreground font-mono mt-0.5">{hoveredDevice?.ip ?? hoveredDevice?.ips[0] ?? hoveredNode.gateway_ip ?? "-"}</p>
           <div className="mt-2 space-y-1 text-muted-foreground">
-            <p>Status: <span className="uppercase text-foreground">{hoveredDevice.status}</span></p>
-            <p>Internet: {hoveredDevice.internet_reachable === null ? "Unknown" : hoveredDevice.internet_reachable ? "Reachable" : "Down"}</p>
-            <p>DNS: {hoveredDevice.dns_ok === null ? "Unknown" : hoveredDevice.dns_ok ? "OK" : "Fail"}</p>
-            <p>Last seen: {formatSince(hoveredDevice.last_seen_ms)}</p>
+            <p>Type: <span className="uppercase text-foreground">{hoveredNode.node_type}</span></p>
+            <p>Gateway: {hoveredDevice?.default_gateway_ip ?? hoveredNode.gateway_ip ?? "Unknown"}</p>
+            <p>Subnet: {hoveredDevice?.subnet_cidr ?? hoveredNode.subnet_cidr ?? "Unknown"}</p>
+            <p>Interface: {hoveredDevice?.interface_type ?? hoveredNode.interface_type ?? "Unknown"}</p>
+            {hoveredDevice && <p>Internet: {hoveredDevice.internet_reachable === null ? "Unknown" : hoveredDevice.internet_reachable ? "Reachable" : "Down"}</p>}
+            {hoveredDevice && <p>DNS: {hoveredDevice.dns_ok === null ? "Unknown" : hoveredDevice.dns_ok ? "OK" : "Fail"}</p>}
+            {hoveredDevice && <p>Last seen: {formatSince(hoveredDevice.last_seen_ms)}</p>}
+            {(hoveredNode.node_type === "gateway" || hoveredNode.node_type === "unknown_hub") && (
+              <p>Attached devices: {hoveredNode.attached_count ?? 0}</p>
+            )}
           </div>
         </div>
       )}

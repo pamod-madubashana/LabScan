@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             get_server_status,
             get_devices_snapshot,
+            get_topology_snapshot,
             get_tasks_snapshot,
             get_activity_snapshot,
             dispatch_task,
@@ -58,6 +59,13 @@ async fn get_devices_snapshot(
 }
 
 #[tauri::command]
+async fn get_topology_snapshot(
+    state: tauri::State<'_, server::ServerManager>,
+) -> Result<server::TopologySnapshot, String> {
+    Ok(state.get_topology_snapshot().await)
+}
+
+#[tauri::command]
 async fn get_tasks_snapshot(
     state: tauri::State<'_, server::ServerManager>,
 ) -> Result<server::TasksSnapshot, String> {
@@ -83,9 +91,7 @@ async fn dispatch_task(
 }
 
 #[tauri::command]
-async fn get_pair_token(
-    state: tauri::State<'_, server::ServerManager>,
-) -> Result<String, String> {
+async fn get_pair_token(state: tauri::State<'_, server::ServerManager>) -> Result<String, String> {
     Ok(state.get_pair_token().await)
 }
 

@@ -20,6 +20,40 @@ export interface DeviceRecord {
   last_internet_change_ms: number | null;
   last_dns_change_ms: number | null;
   first_seen_ms: number;
+  ip?: string | null;
+  subnet_cidr?: string | null;
+  default_gateway_ip?: string | null;
+  interface_type?: "wifi" | "ethernet" | "unknown" | null;
+  mac?: string | null;
+  gateway_mac?: string | null;
+  dhcp_server_ip?: string | null;
+  ssid?: string | null;
+}
+
+export interface TopologyNode {
+  id: string;
+  node_type: "gateway" | "admin" | "host" | "switch" | "subnet" | "unknown_hub";
+  label: string;
+  subnet_cidr?: string | null;
+  gateway_ip?: string | null;
+  agent_id?: string | null;
+  interface_type?: string | null;
+  attached_count?: number | null;
+}
+
+export interface TopologyEdge {
+  id: string;
+  child_id: string;
+  parent_id: string;
+  method: "evidence" | "heuristic" | "manual";
+  confidence: number;
+}
+
+export interface TopologySnapshot {
+  revision: number;
+  updated_at: number;
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
 }
 
 export interface TaskResultRecord {
@@ -68,6 +102,7 @@ export interface ServerStatus {
 export interface LabStateSnapshot {
   server: ServerStatus;
   devices: DeviceRecord[];
+  topology: TopologySnapshot;
   tasks: TaskRecord[];
   logs: LogRecord[];
   activity: ActivityEvent[];
@@ -87,6 +122,7 @@ interface LabScanContextValue {
 const defaultState: LabStateSnapshot = {
   server: { online: false, port_ws: 8148, port_udp: 8870 },
   devices: [],
+  topology: { revision: 0, updated_at: 0, nodes: [], edges: [] },
   tasks: [],
   logs: [],
   activity: [],
@@ -187,9 +223,10 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        const [server, devicesSnapshot, tasksSnapshot, activitySnapshot] = await Promise.all([
+        const [server, devicesSnapshot, topologySnapshot, tasksSnapshot, activitySnapshot] = await Promise.all([
           invoke<ServerStatus>("get_server_status"),
           invoke<{ devices: DeviceRecord[] }>("get_devices_snapshot"),
+          invoke<TopologySnapshot>("get_topology_snapshot"),
           invoke<{ tasks: TaskRecord[] }>("get_tasks_snapshot"),
           invoke<{ events: ActivityEvent[] }>("get_activity_snapshot"),
         ]);
@@ -197,6 +234,7 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
         setState({
           server,
           devices: mergeStableDeviceList([], devicesSnapshot.devices),
+          topology: topologySnapshot,
           tasks: tasksSnapshot.tasks,
           logs: [],
           activity: activitySnapshot.events,
@@ -210,6 +248,14 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
         const unlistenDevices = await listen<{ devices: DeviceRecord[] }>("devices_snapshot", (event) => {
           setState((prev) => ({ ...prev, devices: mergeStableDeviceList(prev.devices, event.payload.devices) }));
           void logger.info("[UI] devices_snapshot", { count: event.payload.devices.length });
+        });
+
+        const unlistenTopologySnapshot = await listen<TopologySnapshot>("topology_snapshot", (event) => {
+          setState((prev) => ({ ...prev, topology: event.payload }));
+        });
+
+        const unlistenTopologyChanged = await listen<TopologySnapshot>("topology_changed", (event) => {
+          setState((prev) => ({ ...prev, topology: event.payload }));
         });
 
         const unlistenDeviceUpsert = await listen<{ device: DeviceRecord }>("device_upsert", (event) => {
@@ -269,6 +315,8 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
           unlistenTaskUpdate,
           unlistenLog,
           unlistenActivity,
+          unlistenTopologySnapshot,
+          unlistenTopologyChanged,
         ];
 
         void logger.info("[UI] subscribed events", {

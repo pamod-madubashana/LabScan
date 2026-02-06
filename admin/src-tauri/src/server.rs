@@ -1,8 +1,7 @@
 use axum::{
     extract::{
-        ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     response::IntoResponse,
     routing::get,
@@ -12,8 +11,11 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    cmp::Ordering,
     collections::{HashMap, VecDeque},
+    net::Ipv4Addr,
     net::SocketAddr,
+    process::Command,
     sync::Arc,
     time::Duration,
 };
@@ -41,6 +43,8 @@ const EVENT_DEVICE_REMOVE: &str = "device_remove";
 const EVENT_LOG: &str = "log_event";
 const EVENT_TASK_UPDATE: &str = "task_update";
 const EVENT_ACTIVITY: &str = "activity_event";
+const EVENT_TOPOLOGY_SNAPSHOT: &str = "topology_snapshot";
+const EVENT_TOPOLOGY_CHANGED: &str = "topology_changed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatus {
@@ -65,11 +69,70 @@ pub struct DeviceRecord {
     pub last_internet_change_ms: Option<i64>,
     pub last_dns_change_ms: Option<i64>,
     pub first_seen_ms: i64,
+    pub ip: Option<String>,
+    pub subnet_cidr: Option<String>,
+    pub default_gateway_ip: Option<String>,
+    pub interface_type: Option<String>,
+    pub mac: Option<String>,
+    pub gateway_mac: Option<String>,
+    pub dhcp_server_ip: Option<String>,
+    pub ssid: Option<String>,
+    #[serde(default)]
+    pub arp_snapshot: Vec<ArpEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevicesSnapshot {
     pub devices: Vec<DeviceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologySnapshot {
+    pub revision: u64,
+    pub updated_at: i64,
+    pub nodes: Vec<TopologyNode>,
+    pub edges: Vec<TopologyEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyNode {
+    pub id: String,
+    pub node_type: String,
+    pub label: String,
+    pub subnet_cidr: Option<String>,
+    pub gateway_ip: Option<String>,
+    pub agent_id: Option<String>,
+    pub interface_type: Option<String>,
+    pub attached_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyEdge {
+    pub id: String,
+    pub child_id: String,
+    pub parent_id: String,
+    pub method: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArpEntry {
+    pub ip: String,
+    pub mac: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkFactsPayload {
+    pub ip: String,
+    pub subnet_cidr: String,
+    pub default_gateway_ip: String,
+    pub interface_type: String,
+    pub mac: Option<String>,
+    pub gateway_mac: Option<String>,
+    pub dhcp_server_ip: Option<String>,
+    pub ssid: Option<String>,
+    #[serde(default)]
+    pub arp_snapshot: Vec<ArpEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +239,8 @@ struct RegisterPayload {
     ips: Vec<String>,
     os: String,
     version: String,
+    #[serde(default)]
+    network: NetworkFactsPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +248,8 @@ struct HeartbeatPayload {
     status: String,
     last_seen: i64,
     metrics: Option<Value>,
+    #[serde(default)]
+    network: NetworkFactsPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +279,9 @@ struct RuntimeState {
     connections: HashMap<String, mpsc::UnboundedSender<Message>>,
     last_device_emit_ms: HashMap<String, i64>,
     last_activity_emit_ms: HashMap<String, i64>,
+    topology_snapshot: TopologySnapshot,
+    topology_key: String,
+    admin_network: NetworkFactsPayload,
 }
 
 #[derive(Clone)]
@@ -239,6 +309,14 @@ impl ServerManager {
                 connections: HashMap::new(),
                 last_device_emit_ms: HashMap::new(),
                 last_activity_emit_ms: HashMap::new(),
+                topology_snapshot: TopologySnapshot {
+                    revision: 0,
+                    updated_at: now_ms(),
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                },
+                topology_key: String::new(),
+                admin_network: detect_admin_network_facts(),
             })),
         }
     }
@@ -248,6 +326,8 @@ impl ServerManager {
         if online {
             return;
         }
+
+        self.rebuild_topology_if_changed(&app).await;
 
         let manager = self.clone();
         let app_for_ws = app.clone();
@@ -287,6 +367,11 @@ impl ServerManager {
                 .collect::<Vec<_>>()
         };
         DevicesSnapshot { devices }
+    }
+
+    pub async fn get_topology_snapshot(&self) -> TopologySnapshot {
+        let state = self.inner.lock().await;
+        state.topology_snapshot.clone()
     }
 
     pub async fn get_tasks_snapshot(&self) -> TasksSnapshot {
@@ -371,8 +456,13 @@ impl ServerManager {
     async fn run_ws_server(&self, app: AppHandle) {
         let bind_addr = format!("0.0.0.0:{}", WS_PORT);
         tracing::info!("[WS] binding addr={}", bind_addr);
-        self.emit_log(&app, None, "INFO", format!("Starting WS server on {}", bind_addr))
-            .await;
+        self.emit_log(
+            &app,
+            None,
+            "INFO",
+            format!("Starting WS server on {}", bind_addr),
+        )
+        .await;
 
         let listener = match TcpListener::bind(&bind_addr).await {
             Ok(listener) => listener,
@@ -387,15 +477,27 @@ impl ServerManager {
 
         self.set_online(&app, true).await;
         tracing::info!("[WS] listening addr={}", bind_addr);
-        self.emit_log(&app, None, "INFO", format!("WS server listening on {}", bind_addr))
-            .await;
+        self.emit_log(
+            &app,
+            None,
+            "INFO",
+            format!("WS server listening on {}", bind_addr),
+        )
+        .await;
 
-        let router = Router::new().route("/ws/agent", get(ws_agent_handler)).with_state(HttpState {
-            manager: self.clone(),
-            app: app.clone(),
-        });
+        let router = Router::new()
+            .route("/ws/agent", get(ws_agent_handler))
+            .with_state(HttpState {
+                manager: self.clone(),
+                app: app.clone(),
+            });
 
-        if let Err(err) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
+        if let Err(err) = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             self.set_online(&app, false).await;
             self.emit_log(&app, None, "ERROR", format!("WS server stopped: {}", err))
                 .await;
@@ -406,14 +508,24 @@ impl ServerManager {
         let send_socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
             Err(err) => {
-                self.emit_log(&app, None, "ERROR", format!("UDP broadcast socket error: {}", err))
-                    .await;
+                self.emit_log(
+                    &app,
+                    None,
+                    "ERROR",
+                    format!("UDP broadcast socket error: {}", err),
+                )
+                .await;
                 return;
             }
         };
         if let Err(err) = send_socket.set_broadcast(true) {
-            self.emit_log(&app, None, "ERROR", format!("UDP broadcast enable failed: {}", err))
-                .await;
+            self.emit_log(
+                &app,
+                None,
+                "ERROR",
+                format!("UDP broadcast enable failed: {}", err),
+            )
+            .await;
             return;
         }
 
@@ -426,7 +538,10 @@ impl ServerManager {
             &app,
             None,
             "INFO",
-            format!("provision: broadcasting on UDP {}, admin_ip={}", UDP_PORT, admin_ip),
+            format!(
+                "provision: broadcasting on UDP {}, admin_ip={}",
+                UDP_PORT, admin_ip
+            ),
         )
         .await;
 
@@ -450,15 +565,24 @@ impl ServerManager {
             }
 
             if let Some(socket) = &ack_socket {
-                if let Ok(result) = tokio::time::timeout(Duration::from_millis(300), socket.recv_from(&mut ack_buffer)).await {
+                if let Ok(result) = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    socket.recv_from(&mut ack_buffer),
+                )
+                .await
+                {
                     if let Ok((len, sender)) = result {
-                        if let Ok(ack) = serde_json::from_slice::<ProvisionAck>(&ack_buffer[..len]) {
+                        if let Ok(ack) = serde_json::from_slice::<ProvisionAck>(&ack_buffer[..len])
+                        {
                             if ack.message_type == "LABSCAN_PROVISION_ACK" && ack.v == 1 {
                                 self.emit_log(
                                     &app,
                                     Some(ack.agent_id),
                                     "INFO",
-                                    format!("Provision ACK from {} ({}) nonce={} ts={}", ack.hostname, sender, ack.nonce, ack.ts),
+                                    format!(
+                                        "Provision ACK from {} ({}) nonce={} ts={}",
+                                        ack.hostname, sender, ack.nonce, ack.ts
+                                    ),
                                 )
                                 .await;
                             }
@@ -486,7 +610,8 @@ impl ServerManager {
             }
             for id in ids {
                 if let Some(device) = self.inner.lock().await.devices.get(&id).cloned() {
-                    self.emit_device_upsert_if_needed(&app, device.clone(), true).await;
+                    self.emit_device_upsert_if_needed(&app, device.clone(), true)
+                        .await;
                     self.emit_activity(
                         &app,
                         "device_disconnected",
@@ -548,13 +673,53 @@ impl ServerManager {
         let _ = app.emit(EVENT_DEVICES_SNAPSHOT, self.get_devices_snapshot().await);
     }
 
-    async fn emit_device_upsert_if_needed(&self, app: &AppHandle, device: DeviceRecord, force: bool) {
+    async fn emit_topology_snapshot(&self, app: &AppHandle) {
+        let snapshot = self.get_topology_snapshot().await;
+        let _ = app.emit(EVENT_TOPOLOGY_SNAPSHOT, snapshot.clone());
+        let _ = app.emit(EVENT_TOPOLOGY_CHANGED, snapshot);
+    }
+
+    async fn rebuild_topology_if_changed(&self, app: &AppHandle) {
+        let changed = {
+            let mut state = self.inner.lock().await;
+            let candidate = build_topology_snapshot(
+                &state.devices,
+                &state.device_order,
+                &state.admin_network,
+                state.topology_snapshot.revision + 1,
+            );
+            let key = topology_key(&candidate);
+            if key != state.topology_key {
+                state.topology_key = key;
+                state.topology_snapshot = candidate;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.emit_topology_snapshot(app).await;
+        }
+    }
+
+    async fn emit_device_upsert_if_needed(
+        &self,
+        app: &AppHandle,
+        device: DeviceRecord,
+        force: bool,
+    ) {
         let now = now_ms();
         let should = {
             let mut state = self.inner.lock().await;
-            let last = state.last_device_emit_ms.get(&device.agent_id).copied().unwrap_or(0);
+            let last = state
+                .last_device_emit_ms
+                .get(&device.agent_id)
+                .copied()
+                .unwrap_or(0);
             if force || now - last >= DEVICE_EMIT_THROTTLE_MS {
-                state.last_device_emit_ms.insert(device.agent_id.clone(), now);
+                state
+                    .last_device_emit_ms
+                    .insert(device.agent_id.clone(), now);
                 true
             } else {
                 false
@@ -575,7 +740,13 @@ impl ServerManager {
         let _ = app.emit(EVENT_TASK_UPDATE, TaskUpdateEvent { task });
     }
 
-    async fn emit_log(&self, app: &AppHandle, agent_id: Option<String>, level: &str, message: String) {
+    async fn emit_log(
+        &self,
+        app: &AppHandle,
+        agent_id: Option<String>,
+        level: &str,
+        message: String,
+    ) {
         let event = LogEvent {
             id: Uuid::new_v4().to_string(),
             agent_id,
@@ -593,12 +764,19 @@ impl ServerManager {
         let _ = app.emit(EVENT_LOG, event);
     }
 
-    async fn emit_activity(&self, app: &AppHandle, kind: &str, agent_id: Option<String>, message: String) {
+    async fn emit_activity(
+        &self,
+        app: &AppHandle,
+        kind: &str,
+        agent_id: Option<String>,
+        message: String,
+    ) {
         let now = now_ms();
         if let Some(ref id) = agent_id {
             let drop_event = {
                 let state = self.inner.lock().await;
-                now - state.last_activity_emit_ms.get(id).copied().unwrap_or(0) < DEVICE_ACTIVITY_RATE_MS
+                now - state.last_activity_emit_ms.get(id).copied().unwrap_or(0)
+                    < DEVICE_ACTIVITY_RATE_MS
             };
             if drop_event {
                 return;
@@ -612,7 +790,10 @@ impl ServerManager {
             }
 
             if let Some(front) = state.activity.front_mut() {
-                if front.kind == kind && front.agent_id == agent_id && now - front.ts <= ACTIVITY_DEDUPE_MS {
+                if front.kind == kind
+                    && front.agent_id == agent_id
+                    && now - front.ts <= ACTIVITY_DEDUPE_MS
+                {
                     front.ts = now;
                     front.count = Some(front.count.unwrap_or(1) + 1);
                     front.clone()
@@ -662,7 +843,8 @@ impl ServerManager {
         };
 
         if let Some(device) = device {
-            self.emit_device_upsert_if_needed(app, device.clone(), true).await;
+            self.emit_device_upsert_if_needed(app, device.clone(), true)
+                .await;
             self.emit_activity(
                 app,
                 "device_disconnected",
@@ -673,6 +855,7 @@ impl ServerManager {
         } else {
             self.emit_device_remove(app, agent_id).await;
         }
+        self.rebuild_topology_if_changed(app).await;
     }
 }
 
@@ -764,28 +947,42 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
             let now = now_ms();
             let (device, was_new, old_status) = {
                 let mut guard = state.manager.inner.lock().await;
-                guard.connections.insert(payload.agent_id.clone(), tx.clone());
+                guard
+                    .connections
+                    .insert(payload.agent_id.clone(), tx.clone());
                 let was_new = !guard.devices.contains_key(&payload.agent_id);
                 if was_new {
                     guard.device_order.push(payload.agent_id.clone());
                 }
 
-                let entry = guard.devices.entry(payload.agent_id.clone()).or_insert(DeviceRecord {
-                    agent_id: payload.agent_id.clone(),
-                    hostname: payload.hostname.clone(),
-                    ips: payload.ips.clone(),
-                    os: payload.os.clone(),
-                    version: payload.version.clone(),
-                    status: "online".to_string(),
-                    last_seen_ms: now,
-                    internet_reachable: None,
-                    dns_ok: None,
-                    gateway_reachable: None,
-                    latency_ms: None,
-                    last_internet_change_ms: None,
-                    last_dns_change_ms: None,
-                    first_seen_ms: now,
-                });
+                let entry = guard
+                    .devices
+                    .entry(payload.agent_id.clone())
+                    .or_insert(DeviceRecord {
+                        agent_id: payload.agent_id.clone(),
+                        hostname: payload.hostname.clone(),
+                        ips: payload.ips.clone(),
+                        os: payload.os.clone(),
+                        version: payload.version.clone(),
+                        status: "online".to_string(),
+                        last_seen_ms: now,
+                        internet_reachable: None,
+                        dns_ok: None,
+                        gateway_reachable: None,
+                        latency_ms: None,
+                        last_internet_change_ms: None,
+                        last_dns_change_ms: None,
+                        first_seen_ms: now,
+                        ip: None,
+                        subnet_cidr: None,
+                        default_gateway_ip: None,
+                        interface_type: None,
+                        mac: None,
+                        gateway_mac: None,
+                        dhcp_server_ip: None,
+                        ssid: None,
+                        arp_snapshot: Vec::new(),
+                    });
 
                 let old_status = entry.status.clone();
                 entry.hostname = payload.hostname;
@@ -794,6 +991,7 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                 entry.version = payload.version;
                 entry.status = "online".to_string();
                 entry.last_seen_ms = now;
+                apply_network_payload(entry, &payload.network);
                 (entry.clone(), was_new, old_status)
             };
 
@@ -825,6 +1023,7 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                     )
                     .await;
             }
+            state.manager.rebuild_topology_if_changed(&state.app).await;
             continue;
         }
 
@@ -845,7 +1044,11 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                             let old_internet = device.internet_reachable;
                             let old_dns = device.dns_ok;
 
-                            device.last_seen_ms = if payload.last_seen > 0 { payload.last_seen } else { now };
+                            device.last_seen_ms = if payload.last_seen > 0 {
+                                payload.last_seen
+                            } else {
+                                now
+                            };
                             if !payload.status.is_empty() {
                                 device.status = payload.status;
                             }
@@ -863,6 +1066,8 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                                     device.latency_ms = v.as_i64();
                                 }
                             }
+
+                            apply_network_payload(device, &payload.network);
 
                             let status_changed = if old_status != device.status {
                                 Some((old_status, device.status.clone()))
@@ -884,7 +1089,12 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                                 None
                             };
 
-                            (Some(device.clone()), status_changed, internet_changed, dns_changed)
+                            (
+                                Some(device.clone()),
+                                status_changed,
+                                internet_changed,
+                                dns_changed,
+                            )
                         } else {
                             (None, None, None, None)
                         }
@@ -947,6 +1157,7 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                                 )
                                 .await;
                         }
+                        state.manager.rebuild_topology_if_changed(&state.app).await;
                     }
                 }
             }
@@ -978,7 +1189,10 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                     };
 
                     if let Some(task) = maybe_task {
-                        state.manager.emit_task_update(&state.app, task.clone()).await;
+                        state
+                            .manager
+                            .emit_task_update(&state.app, task.clone())
+                            .await;
                         let kind = if task.status == "failed" {
                             "task_failed"
                         } else if task.status == "done" {
@@ -1005,8 +1219,504 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
     write_task.abort();
     if let Some(agent_id) = registered_agent_id {
         tracing::info!("[WS] disconnect agent_id={}", agent_id);
-        state.manager.on_agent_disconnect(&state.app, agent_id).await;
+        state
+            .manager
+            .on_agent_disconnect(&state.app, agent_id)
+            .await;
     }
+}
+
+fn apply_network_payload(device: &mut DeviceRecord, network: &NetworkFactsPayload) {
+    let ip = clean_non_empty_owned(&network.ip).or_else(|| {
+        device
+            .ips
+            .iter()
+            .find_map(|candidate| clean_non_empty_owned(candidate))
+    });
+    device.ip = ip;
+    device.subnet_cidr = clean_non_empty_owned(&network.subnet_cidr)
+        .or_else(|| device.ip.as_deref().and_then(guess_subnet_from_ip));
+    device.default_gateway_ip = clean_non_empty_owned(&network.default_gateway_ip);
+    device.interface_type = clean_non_empty_owned(&network.interface_type);
+    device.mac = network.mac.clone().and_then(|v| clean_non_empty_owned(&v));
+    device.gateway_mac = network
+        .gateway_mac
+        .clone()
+        .and_then(|v| clean_non_empty_owned(&v));
+    device.dhcp_server_ip = network
+        .dhcp_server_ip
+        .clone()
+        .and_then(|v| clean_non_empty_owned(&v));
+    device.ssid = network.ssid.clone().and_then(|v| clean_non_empty_owned(&v));
+    if !network.arp_snapshot.is_empty() {
+        device.arp_snapshot = network.arp_snapshot.clone();
+    }
+}
+
+fn build_topology_snapshot(
+    devices: &HashMap<String, DeviceRecord>,
+    device_order: &[String],
+    admin_network: &NetworkFactsPayload,
+    revision: u64,
+) -> TopologySnapshot {
+    let mut nodes: Vec<TopologyNode> = Vec::new();
+    let mut edges: Vec<TopologyEdge> = Vec::new();
+
+    let mut host_records: Vec<DeviceRecord> = device_order
+        .iter()
+        .filter_map(|id| devices.get(id).cloned())
+        .collect();
+    host_records.sort_by(compare_device_topology_order);
+
+    let admin_ip = clean_non_empty_owned(&admin_network.ip)
+        .or_else(detect_local_ipv4_string)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let admin_subnet = clean_non_empty_owned(&admin_network.subnet_cidr)
+        .or_else(|| guess_subnet_from_ip(&admin_ip));
+    let admin_gateway = clean_non_empty_owned(&admin_network.default_gateway_ip);
+
+    let mut gateway_by_key: HashMap<String, String> = HashMap::new();
+    let mut subnet_nodes: HashMap<String, String> = HashMap::new();
+    let mut gateway_specs: Vec<(String, Option<String>)> = Vec::new();
+    let mut attachment_count: HashMap<String, usize> = HashMap::new();
+
+    let mut observed_subnets: Vec<String> = host_records
+        .iter()
+        .filter_map(|d| d.subnet_cidr.clone())
+        .collect();
+    if let Some(s) = admin_subnet.clone() {
+        observed_subnets.push(s);
+    }
+    observed_subnets.sort();
+    observed_subnets.dedup();
+    let use_subnet_nodes = observed_subnets.len() > 1;
+
+    if use_subnet_nodes {
+        for subnet in &observed_subnets {
+            let subnet_id = format!("subnet:{}", subnet);
+            subnet_nodes.insert(subnet.clone(), subnet_id.clone());
+            nodes.push(TopologyNode {
+                id: subnet_id,
+                node_type: "subnet".to_string(),
+                label: subnet.clone(),
+                subnet_cidr: Some(subnet.clone()),
+                gateway_ip: None,
+                agent_id: None,
+                interface_type: None,
+                attached_count: None,
+            });
+        }
+    }
+
+    if let Some(gw) = admin_gateway.clone() {
+        gateway_specs.push((gw, admin_subnet.clone()));
+    }
+    for host in &host_records {
+        if let Some(gw) = host
+            .default_gateway_ip
+            .clone()
+            .and_then(|v| clean_non_empty_owned(&v))
+        {
+            gateway_specs.push((gw, host.subnet_cidr.clone()));
+        }
+    }
+    gateway_specs.sort_by(|a, b| {
+        let subnet_cmp = a.1.cmp(&b.1);
+        if subnet_cmp != Ordering::Equal {
+            return subnet_cmp;
+        }
+        let a_ip = ip_to_u32(&a.0);
+        let b_ip = ip_to_u32(&b.0);
+        match (a_ip, b_ip) {
+            (Some(x), Some(y)) if x != y => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            _ => a.0.cmp(&b.0),
+        }
+    });
+    gateway_specs.dedup();
+
+    for (gateway_ip, subnet) in gateway_specs {
+        let subnet_key = subnet.clone().unwrap_or_default();
+        let key = format!("{}|{}", subnet_key, gateway_ip);
+        let gateway_id = format!("gw:{}", gateway_ip);
+        gateway_by_key.insert(key, gateway_id.clone());
+        nodes.push(TopologyNode {
+            id: gateway_id.clone(),
+            node_type: "gateway".to_string(),
+            label: format!("Gateway {}", gateway_ip),
+            subnet_cidr: subnet.clone(),
+            gateway_ip: Some(gateway_ip.clone()),
+            agent_id: None,
+            interface_type: None,
+            attached_count: None,
+        });
+
+        if use_subnet_nodes {
+            if let Some(subnet_value) = subnet {
+                if let Some(subnet_id) = subnet_nodes.get(&subnet_value) {
+                    edges.push(TopologyEdge {
+                        id: format!("{}->{}", gateway_id, subnet_id),
+                        child_id: gateway_id,
+                        parent_id: subnet_id.clone(),
+                        method: "evidence".to_string(),
+                        confidence: 1.0,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut unknown_hub_ids: HashMap<String, String> = HashMap::new();
+
+    let admin_id = "admin:self".to_string();
+    nodes.push(TopologyNode {
+        id: admin_id.clone(),
+        node_type: "admin".to_string(),
+        label: "Admin".to_string(),
+        subnet_cidr: admin_subnet.clone(),
+        gateway_ip: admin_gateway.clone(),
+        agent_id: None,
+        interface_type: clean_non_empty_owned(&admin_network.interface_type),
+        attached_count: None,
+    });
+    let admin_parent = if let Some(gw) = admin_gateway.clone() {
+        let key = format!("{}|{}", admin_subnet.clone().unwrap_or_default(), gw);
+        let parent_id = gateway_by_key
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| format!("gw:{}", gw));
+        (parent_id, "evidence".to_string(), 0.9)
+    } else {
+        (
+            ensure_unknown_hub_node(
+                &mut nodes,
+                &mut edges,
+                &subnet_nodes,
+                &mut unknown_hub_ids,
+                admin_subnet.clone(),
+                use_subnet_nodes,
+            ),
+            "heuristic".to_string(),
+            0.5,
+        )
+    };
+    edges.push(TopologyEdge {
+        id: format!("{}->{}", admin_id, admin_parent.0),
+        child_id: admin_id,
+        parent_id: admin_parent.0.clone(),
+        method: admin_parent.1,
+        confidence: admin_parent.2,
+    });
+    *attachment_count.entry(admin_parent.0).or_insert(0) += 1;
+
+    for host in host_records {
+        let node_id = format!("host:{}", host.agent_id);
+        nodes.push(TopologyNode {
+            id: node_id.clone(),
+            node_type: "host".to_string(),
+            label: host.hostname.clone(),
+            subnet_cidr: host.subnet_cidr.clone(),
+            gateway_ip: host.default_gateway_ip.clone(),
+            agent_id: Some(host.agent_id.clone()),
+            interface_type: host.interface_type.clone(),
+            attached_count: None,
+        });
+
+        let (parent_id, method, confidence) = if let Some(gw) = host
+            .default_gateway_ip
+            .clone()
+            .and_then(|v| clean_non_empty_owned(&v))
+        {
+            let key = format!("{}|{}", host.subnet_cidr.clone().unwrap_or_default(), gw);
+            let parent_id = gateway_by_key
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| format!("gw:{}", gw));
+            (parent_id, "evidence".to_string(), 0.9)
+        } else {
+            (
+                ensure_unknown_hub_node(
+                    &mut nodes,
+                    &mut edges,
+                    &subnet_nodes,
+                    &mut unknown_hub_ids,
+                    host.subnet_cidr.clone(),
+                    use_subnet_nodes,
+                ),
+                "heuristic".to_string(),
+                0.45,
+            )
+        };
+
+        edges.push(TopologyEdge {
+            id: format!("{}->{}", node_id, parent_id),
+            child_id: node_id,
+            parent_id: parent_id.clone(),
+            method,
+            confidence,
+        });
+        *attachment_count.entry(parent_id).or_insert(0) += 1;
+    }
+
+    for node in &mut nodes {
+        if node.node_type == "gateway" || node.node_type == "unknown_hub" {
+            node.attached_count = Some(*attachment_count.get(&node.id).unwrap_or(&0));
+        }
+    }
+
+    nodes.sort_by(compare_topology_nodes);
+    edges.sort_by(|a, b| {
+        let child = a.child_id.cmp(&b.child_id);
+        if child != Ordering::Equal {
+            return child;
+        }
+        a.parent_id.cmp(&b.parent_id)
+    });
+
+    TopologySnapshot {
+        revision,
+        updated_at: now_ms(),
+        nodes,
+        edges,
+    }
+}
+
+fn ensure_unknown_hub_node(
+    nodes: &mut Vec<TopologyNode>,
+    edges: &mut Vec<TopologyEdge>,
+    subnet_nodes: &HashMap<String, String>,
+    unknown_hub_ids: &mut HashMap<String, String>,
+    subnet: Option<String>,
+    use_subnet_nodes: bool,
+) -> String {
+    let subnet_key = subnet.clone().unwrap_or_else(|| "unknown".to_string());
+    if let Some(existing) = unknown_hub_ids.get(&subnet_key) {
+        return existing.clone();
+    }
+
+    let hub_id = format!("hub:{}", subnet_key);
+    nodes.push(TopologyNode {
+        id: hub_id.clone(),
+        node_type: "unknown_hub".to_string(),
+        label: "Unknown Hub".to_string(),
+        subnet_cidr: subnet.clone(),
+        gateway_ip: None,
+        agent_id: None,
+        interface_type: None,
+        attached_count: None,
+    });
+
+    if use_subnet_nodes {
+        if let Some(subnet_value) = subnet {
+            if let Some(subnet_id) = subnet_nodes.get(&subnet_value) {
+                edges.push(TopologyEdge {
+                    id: format!("{}->{}", hub_id, subnet_id),
+                    child_id: hub_id.clone(),
+                    parent_id: subnet_id.clone(),
+                    method: "heuristic".to_string(),
+                    confidence: 0.5,
+                });
+            }
+        }
+    }
+
+    unknown_hub_ids.insert(subnet_key, hub_id.clone());
+    hub_id
+}
+
+fn compare_device_topology_order(a: &DeviceRecord, b: &DeviceRecord) -> Ordering {
+    let a_ip =
+        a.ip.as_deref()
+            .or_else(|| a.ips.first().map(String::as_str))
+            .and_then(ip_to_u32);
+    let b_ip =
+        b.ip.as_deref()
+            .or_else(|| b.ips.first().map(String::as_str))
+            .and_then(ip_to_u32);
+    match (a_ip, b_ip) {
+        (Some(x), Some(y)) if x != y => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        _ => {
+            let host_cmp = a.hostname.cmp(&b.hostname);
+            if host_cmp != Ordering::Equal {
+                host_cmp
+            } else {
+                a.agent_id.cmp(&b.agent_id)
+            }
+        }
+    }
+}
+
+fn compare_topology_nodes(a: &TopologyNode, b: &TopologyNode) -> Ordering {
+    let rank = |node_type: &str| match node_type {
+        "subnet" => 0,
+        "gateway" => 1,
+        "switch" => 2,
+        "unknown_hub" => 3,
+        "admin" => 4,
+        "host" => 5,
+        _ => 6,
+    };
+    let r = rank(&a.node_type).cmp(&rank(&b.node_type));
+    if r != Ordering::Equal {
+        return r;
+    }
+
+    let a_ip = a
+        .gateway_ip
+        .as_deref()
+        .and_then(ip_to_u32)
+        .or_else(|| ip_to_u32(&a.label));
+    let b_ip = b
+        .gateway_ip
+        .as_deref()
+        .and_then(ip_to_u32)
+        .or_else(|| ip_to_u32(&b.label));
+    match (a_ip, b_ip) {
+        (Some(x), Some(y)) if x != y => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        _ => a.id.cmp(&b.id),
+    }
+}
+
+fn topology_key(snapshot: &TopologySnapshot) -> String {
+    let mut node_parts: Vec<String> = snapshot
+        .nodes
+        .iter()
+        .map(|n| {
+            format!(
+                "{}|{}|{}|{}",
+                n.id,
+                n.node_type,
+                n.subnet_cidr.clone().unwrap_or_default(),
+                n.gateway_ip.clone().unwrap_or_default()
+            )
+        })
+        .collect();
+    node_parts.sort();
+    let mut edge_parts: Vec<String> = snapshot
+        .edges
+        .iter()
+        .map(|e| format!("{}|{}|{}", e.child_id, e.parent_id, e.method))
+        .collect();
+    edge_parts.sort();
+    format!("{}#{}", node_parts.join(";"), edge_parts.join(";"))
+}
+
+fn detect_admin_network_facts() -> NetworkFactsPayload {
+    let ip = detect_local_ipv4_string().unwrap_or_else(|| "127.0.0.1".to_string());
+    let default_gateway_ip = detect_default_gateway_ip().unwrap_or_default();
+    let subnet_cidr = guess_subnet_from_ip(&ip).unwrap_or_else(|| "127.0.0.0/24".to_string());
+
+    NetworkFactsPayload {
+        ip,
+        subnet_cidr,
+        default_gateway_ip,
+        interface_type: detect_interface_type(),
+        mac: None,
+        gateway_mac: None,
+        dhcp_server_ip: None,
+        ssid: detect_ssid(),
+        arp_snapshot: Vec::new(),
+    }
+}
+
+fn detect_local_ipv4_string() -> Option<String> {
+    detect_local_ipv4().map(|ip| ip.to_string())
+}
+
+fn detect_default_gateway_ip() -> Option<String> {
+    if cfg!(target_os = "windows") {
+        let out = command_output("route", &["print", "-4"])?;
+        for line in out.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 3
+                && fields[0] == "0.0.0.0"
+                && fields[1] == "0.0.0.0"
+                && ip_to_u32(fields[2]).is_some()
+            {
+                return Some(fields[2].to_string());
+            }
+        }
+    }
+
+    if cfg!(target_os = "linux") {
+        let out = command_output("ip", &["route", "show", "default"])?;
+        let parts: Vec<&str> = out.split_whitespace().collect();
+        for i in 0..parts.len().saturating_sub(1) {
+            if parts[i] == "via" && ip_to_u32(parts[i + 1]).is_some() {
+                return Some(parts[i + 1].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn detect_interface_type() -> String {
+    if cfg!(target_os = "windows") {
+        if let Some(out) = command_output("netsh", &["wlan", "show", "interfaces"]) {
+            let lower = out.to_lowercase();
+            if lower.contains("ssid") && !lower.contains("there is no wireless interface") {
+                return "wifi".to_string();
+            }
+        }
+    }
+    "ethernet".to_string()
+}
+
+fn detect_ssid() -> Option<String> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let out = command_output("netsh", &["wlan", "show", "interfaces"])?;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("ssid") && !lower.starts_with("bssid") {
+            let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                let ssid = parts[1].trim();
+                if !ssid.is_empty() {
+                    return Some(ssid.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(command).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+fn clean_non_empty_owned(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn guess_subnet_from_ip(ip: &str) -> Option<String> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 {
+        Some(format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
+fn ip_to_u32(value: &str) -> Option<u32> {
+    let ip: Ipv4Addr = value.parse().ok()?;
+    Some(u32::from(ip))
 }
 
 fn detect_local_ipv4() -> Option<std::net::Ipv4Addr> {

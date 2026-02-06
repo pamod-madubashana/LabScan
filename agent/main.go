@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,7 +12,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,19 +64,38 @@ type WireMessage struct {
 }
 
 type RegisterPayload struct {
-	AgentID  string   `json:"agent_id"`
-	Secret   string   `json:"secret"`
-	Hostname string   `json:"hostname"`
-	IPs      []string `json:"ips"`
-	OS       string   `json:"os"`
-	Arch     string   `json:"arch"`
-	Version  string   `json:"version"`
+	AgentID  string       `json:"agent_id"`
+	Secret   string       `json:"secret"`
+	Hostname string       `json:"hostname"`
+	IPs      []string     `json:"ips"`
+	OS       string       `json:"os"`
+	Arch     string       `json:"arch"`
+	Version  string       `json:"version"`
+	Network  NetworkFacts `json:"network"`
 }
 
 type HeartbeatPayload struct {
 	Status   string                 `json:"status"`
 	LastSeen int64                  `json:"last_seen"`
 	Metrics  map[string]interface{} `json:"metrics,omitempty"`
+	Network  NetworkFacts           `json:"network"`
+}
+
+type ArpEntry struct {
+	IP  string `json:"ip"`
+	MAC string `json:"mac"`
+}
+
+type NetworkFacts struct {
+	IP               string     `json:"ip"`
+	SubnetCIDR       string     `json:"subnet_cidr"`
+	DefaultGatewayIP string     `json:"default_gateway_ip"`
+	InterfaceType    string     `json:"interface_type"`
+	MAC              string     `json:"mac,omitempty"`
+	GatewayMAC       string     `json:"gateway_mac,omitempty"`
+	ARPSnapshot      []ArpEntry `json:"arp_snapshot,omitempty"`
+	DHCPServerIP     string     `json:"dhcp_server_ip,omitempty"`
+	SSID             string     `json:"ssid,omitempty"`
 }
 
 type TaskPayload struct {
@@ -110,6 +132,9 @@ type AgentClient struct {
 	writeMu   sync.Mutex
 	probeMu   sync.Mutex
 	probe     ProbeState
+	networkMu sync.Mutex
+	network   NetworkFacts
+	lastARPMS int64
 }
 
 type ProbeState struct {
@@ -326,6 +351,7 @@ func (c *AgentClient) runSession(parent context.Context) (bool, error) {
 		OS:       runtime.GOOS,
 		Arch:     runtime.GOARCH,
 		Version:  agentVersion,
+		Network:  c.collectAndStoreNetworkFacts(true),
 	}); err != nil {
 		return false, err
 	}
@@ -353,6 +379,7 @@ func (c *AgentClient) runSession(parent context.Context) (bool, error) {
 
 	go c.heartbeatLoop(ctx)
 	go c.probeLoop(ctx)
+	go c.networkFactsLoop(ctx)
 	err = <-errCh
 	if err != nil {
 		log.Printf("WS closed err=%v -> entering sleep", err)
@@ -423,6 +450,7 @@ func (c *AgentClient) heartbeatLoop(ctx context.Context) {
 			payload := HeartbeatPayload{
 				Status:   "idle",
 				LastSeen: nowMS(),
+				Network:  c.networkSnapshot(),
 				Metrics: map[string]interface{}{
 					"goroutines":         runtime.NumGoroutine(),
 					"internet_reachable": internet,
@@ -470,6 +498,38 @@ func (c *AgentClient) probeLoop(ctx context.Context) {
 			probeAndStore()
 		}
 	}
+}
+
+func (c *AgentClient) networkFactsLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			includeARP := nowMS()-c.lastARPMS >= 120000
+			c.collectAndStoreNetworkFacts(includeARP)
+		}
+	}
+}
+
+func (c *AgentClient) collectAndStoreNetworkFacts(includeARP bool) NetworkFacts {
+	facts := collectNetworkFacts(includeARP)
+	c.networkMu.Lock()
+	c.network = facts
+	if includeARP {
+		c.lastARPMS = nowMS()
+	}
+	c.networkMu.Unlock()
+	return facts
+}
+
+func (c *AgentClient) networkSnapshot() NetworkFacts {
+	c.networkMu.Lock()
+	defer c.networkMu.Unlock()
+	return c.network
 }
 
 func (c *AgentClient) probeSnapshot() (*bool, *bool, *bool, *int64) {
@@ -684,6 +744,296 @@ func localIPv4s() []string {
 		return []string{"127.0.0.1"}
 	}
 	return ips
+}
+
+func collectNetworkFacts(includeARP bool) NetworkFacts {
+	gw := detectDefaultGatewayIPv4()
+	iface, ipNet := pickPrimaryInterface(gw)
+
+	ip := ""
+	subnet := ""
+	ifaceType := "unknown"
+	mac := ""
+	if iface != nil {
+		mac = normalizeMAC(iface.HardwareAddr.String())
+		ifaceType = detectInterfaceType(iface.Name)
+	}
+	if ipNet != nil {
+		ip = ipNet.IP.To4().String()
+		subnet = (&net.IPNet{IP: ipNet.IP.Mask(ipNet.Mask), Mask: ipNet.Mask}).String()
+	}
+	if ip == "" {
+		ips := localIPv4s()
+		if len(ips) > 0 {
+			ip = ips[0]
+		}
+	}
+	if subnet == "" && ip != "" {
+		subnet = defaultSubnetCIDR(ip)
+	}
+
+	arpEntries := []ArpEntry{}
+	if includeARP {
+		arpEntries = readARPSnapshot()
+	}
+
+	gatewayMAC := ""
+	if gw != "" {
+		if len(arpEntries) == 0 {
+			arpEntries = readARPSnapshot()
+		}
+		for _, entry := range arpEntries {
+			if entry.IP == gw {
+				gatewayMAC = entry.MAC
+				break
+			}
+		}
+	}
+
+	dhcpServer := detectDHCPServerIP()
+	ssid := detectSSID(ifaceType)
+
+	return NetworkFacts{
+		IP:               ip,
+		SubnetCIDR:       subnet,
+		DefaultGatewayIP: gw,
+		InterfaceType:    ifaceType,
+		MAC:              mac,
+		GatewayMAC:       gatewayMAC,
+		ARPSnapshot:      arpEntries,
+		DHCPServerIP:     dhcpServer,
+		SSID:             ssid,
+	}
+}
+
+func pickPrimaryInterface(gatewayIP string) (*net.Interface, *net.IPNet) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, nil
+	}
+
+	var gateway net.IP
+	if gatewayIP != "" {
+		gateway = net.ParseIP(gatewayIP)
+	}
+
+	for i := range interfaces {
+		iface := interfaces[i]
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			netAddr, ok := addr.(*net.IPNet)
+			if !ok || netAddr.IP == nil || netAddr.IP.To4() == nil {
+				continue
+			}
+			if gateway != nil && netAddr.Contains(gateway) {
+				return &iface, netAddr
+			}
+		}
+	}
+
+	for i := range interfaces {
+		iface := interfaces[i]
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			netAddr, ok := addr.(*net.IPNet)
+			if ok && netAddr.IP != nil && netAddr.IP.To4() != nil {
+				return &iface, netAddr
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+func detectDefaultGatewayIPv4() string {
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("route", "print", "-4").CombinedOutput()
+		if err == nil {
+			s := string(out)
+			for _, line := range strings.Split(s, "\n") {
+				fields := strings.Fields(line)
+				if len(fields) >= 3 && fields[0] == "0.0.0.0" && fields[1] == "0.0.0.0" && isIPv4(fields[2]) {
+					return fields[2]
+				}
+			}
+		}
+	}
+
+	if runtime.GOOS == "linux" {
+		if data, err := os.ReadFile("/proc/net/route"); err == nil {
+			scanner := bufio.NewScanner(strings.NewReader(string(data)))
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				parts := strings.Fields(line)
+				if len(parts) < 3 || parts[1] != "00000000" {
+					continue
+				}
+				if gw, err := hexLittleEndianToIPv4(parts[2]); err == nil {
+					return gw
+				}
+			}
+		}
+
+		out, err := exec.Command("ip", "route", "show", "default").CombinedOutput()
+		if err == nil {
+			fields := strings.Fields(string(out))
+			for i := 0; i < len(fields)-1; i++ {
+				if fields[i] == "via" && isIPv4(fields[i+1]) {
+					return fields[i+1]
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func detectInterfaceType(interfaceName string) string {
+	name := strings.ToLower(interfaceName)
+	if strings.Contains(name, "wi-fi") || strings.Contains(name, "wifi") || strings.Contains(name, "wlan") || strings.Contains(name, "wireless") {
+		return "wifi"
+	}
+	if runtime.GOOS == "linux" {
+		if _, err := os.Stat("/sys/class/net/" + interfaceName + "/wireless"); err == nil {
+			return "wifi"
+		}
+	}
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("netsh", "wlan", "show", "interfaces").CombinedOutput()
+		if err == nil {
+			raw := strings.ToLower(string(out))
+			if strings.Contains(raw, "ssid") && !strings.Contains(raw, "there is no wireless interface") {
+				return "wifi"
+			}
+		}
+	}
+	if interfaceName != "" {
+		return "ethernet"
+	}
+	return "unknown"
+}
+
+func readARPSnapshot() []ArpEntry {
+	entries := []ArpEntry{}
+	lines := []string{}
+
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("arp", "-a").CombinedOutput()
+		if err != nil {
+			return entries
+		}
+		lines = strings.Split(string(out), "\n")
+	} else {
+		out, err := exec.Command("ip", "neigh").CombinedOutput()
+		if err != nil {
+			return entries
+		}
+		lines = strings.Split(string(out), "\n")
+	}
+
+	ipPattern := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+	macPattern := regexp.MustCompile(`(?i)\b[0-9a-f]{2}[:-][0-9a-f]{2}[:-][0-9a-f]{2}[:-][0-9a-f]{2}[:-][0-9a-f]{2}[:-][0-9a-f]{2}\b`)
+	seen := make(map[string]struct{})
+
+	for _, line := range lines {
+		ip := ipPattern.FindString(line)
+		mac := macPattern.FindString(line)
+		if ip == "" || mac == "" || !isIPv4(ip) {
+			continue
+		}
+		key := ip + "|" + strings.ToLower(mac)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		entries = append(entries, ArpEntry{IP: ip, MAC: normalizeMAC(mac)})
+	}
+	return entries
+}
+
+func detectDHCPServerIP() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	out, err := exec.Command("ipconfig", "/all").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	ipPattern := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(strings.ToLower(line), "dhcp server") {
+			continue
+		}
+		if ip := ipPattern.FindString(line); isIPv4(ip) {
+			return ip
+		}
+	}
+	return ""
+}
+
+func detectSSID(interfaceType string) string {
+	if runtime.GOOS != "windows" || interfaceType != "wifi" {
+		return ""
+	}
+	out, err := exec.Command("netsh", "wlan", "show", "interfaces").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "ssid") && !strings.HasPrefix(lower, "bssid") {
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
+}
+
+func hexLittleEndianToIPv4(hexValue string) (string, error) {
+	if len(hexValue) < 8 {
+		return "", fmt.Errorf("invalid hex gateway")
+	}
+	v, err := strconv.ParseUint(hexValue[:8], 16, 32)
+	if err != nil {
+		return "", err
+	}
+	b1 := byte(v & 0xFF)
+	b2 := byte((v >> 8) & 0xFF)
+	b3 := byte((v >> 16) & 0xFF)
+	b4 := byte((v >> 24) & 0xFF)
+	return fmt.Sprintf("%d.%d.%d.%d", b1, b2, b3, b4), nil
+}
+
+func defaultSubnetCIDR(ip string) string {
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return ""
+	}
+	return parts[0] + "." + parts[1] + "." + parts[2] + ".0/24"
+}
+
+func normalizeMAC(mac string) string {
+	return strings.ToLower(strings.ReplaceAll(mac, "-", ":"))
+}
+
+func isIPv4(v string) bool {
+	ip := net.ParseIP(strings.TrimSpace(v))
+	return ip != nil && ip.To4() != nil
 }
 
 func isPrivateIP(ip net.IP) bool {
