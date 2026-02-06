@@ -16,11 +16,16 @@ use tracing_subscriber;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+    tracing::info!("Tauri backend startup");
 
     let db = Arc::new(Mutex::new(database::init_database()?));
     let app_state = server::AppState { db };
 
     tauri::Builder::default()
+        .setup(|_| {
+            tracing::info!("Tauri app setup complete");
+            Ok(())
+        })
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             start_server,
