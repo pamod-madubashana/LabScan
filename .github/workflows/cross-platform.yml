@@ -67,6 +67,10 @@ jobs:
         shell: bash
         run: npm install
 
+      - name: Install Tauri CLI
+        shell: bash
+        run: npm install -g @tauri-apps/cli
+
       - name: Build Tauri bundles
         working-directory: admin
         shell: bash
