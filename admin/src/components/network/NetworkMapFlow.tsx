@@ -1,12 +1,17 @@
 import { useMemo, useRef, useState } from "react";
-import ReactFlow, { Background, Controls, MiniMap, type Edge, type Node, type NodeTypes } from "reactflow";
+import ReactFlow, { Background, Controls, MiniMap, type Edge, type EdgeTypes, type Node, type NodeTypes } from "reactflow";
 import { BackgroundVariant } from "reactflow";
 import "reactflow/dist/style.css";
 import { formatSince, useLabScan } from "@/lib/labscan";
 import { LabscanNode } from "./LabscanNode";
+import { LabscanOrthogonalEdge } from "./LabscanOrthogonalEdge";
 
 const nodeTypes: NodeTypes = {
   labscanNode: LabscanNode,
+};
+
+const edgeTypes: EdgeTypes = {
+  labscanOrthogonal: LabscanOrthogonalEdge,
 };
 
 function ipToNumber(ip?: string | null): number | null {
@@ -27,6 +32,22 @@ function compareNodeIdsByIpLike(a: string, b: string): number {
   return a.localeCompare(b);
 }
 
+function compareByNumericIp(a?: string | null, b?: string | null): number {
+  const aNum = ipToNumber(a);
+  const bNum = ipToNumber(b);
+  if (aNum === null && bNum !== null) return 1;
+  if (aNum !== null && bNum === null) return -1;
+  if (aNum !== null && bNum !== null && aNum !== bNum) return aNum - bNum;
+  return String(a ?? "").localeCompare(String(b ?? ""));
+}
+
+function edgeLabelFromIp(ip?: string | null): string | undefined {
+  if (!ip) return undefined;
+  const parts = ip.split(".");
+  if (parts.length !== 4) return undefined;
+  return parts[3];
+}
+
 export function NetworkMapFlow() {
   const { state, focusedAgentId, setFocusedAgentId } = useLabScan();
   const [hoveredId, setHoveredId] = useState<string | undefined>();
@@ -34,6 +55,51 @@ export function NetworkMapFlow() {
   const devicesByAgent = useMemo(() => new Map(state.devices.map((d) => [d.agent_id, d])), [state.devices]);
   const topology = state.topology;
   const topologyKey = `rev:${topology.revision}`;
+
+  const nodeById = useMemo(() => new Map(topology.nodes.map((node) => [node.id, node])), [topology.nodes]);
+  const hostIpByNodeId = useMemo(() => {
+    const map = new Map<string, string | undefined>();
+    for (const node of topology.nodes) {
+      if (!node.agent_id) continue;
+      const device = devicesByAgent.get(node.agent_id);
+      map.set(node.id, device?.ip ?? device?.ips[0]);
+    }
+    return map;
+  }, [topology.nodes, devicesByAgent]);
+
+  const attachmentOrderByParent = useMemo(() => {
+    const perParent = new Map<string, string[]>();
+    for (const edge of topology.edges) {
+      const childNode = nodeById.get(edge.child_id);
+      const parentNode = nodeById.get(edge.parent_id);
+      if (!childNode || !parentNode) continue;
+      if (childNode.node_type !== "host" && childNode.node_type !== "admin") continue;
+      if (parentNode.node_type !== "gateway" && parentNode.node_type !== "unknown_hub" && parentNode.node_type !== "switch") continue;
+      const list = perParent.get(edge.parent_id) ?? [];
+      list.push(edge.child_id);
+      perParent.set(edge.parent_id, list);
+    }
+
+    for (const [parentId, childIds] of perParent) {
+      childIds.sort((a, b) => {
+        const ipCmp = compareByNumericIp(hostIpByNodeId.get(a), hostIpByNodeId.get(b));
+        if (ipCmp !== 0) return ipCmp;
+        return a.localeCompare(b);
+      });
+      perParent.set(parentId, childIds);
+    }
+    return perParent;
+  }, [topology.edges, nodeById, hostIpByNodeId]);
+
+  const handleCountByGateway = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const node of topology.nodes) {
+      if (node.node_type !== "gateway") continue;
+      const count = attachmentOrderByParent.get(node.id)?.length ?? 0;
+      map.set(node.id, Math.min(32, Math.max(8, count * 2 || 8)));
+    }
+    return map;
+  }, [topology.nodes, attachmentOrderByParent]);
 
   const positionsRef = useRef<Record<string, { x: number; y: number }>>({});
   const lastTopologyKeyRef = useRef("");
@@ -105,10 +171,11 @@ export function NetworkMapFlow() {
 
       const center = nextPositions[parentId];
       const radius = parentId.startsWith("gw:") ? 230 : 120;
+      const hostXBias = 26;
       children.forEach((childId, idx) => {
         const angle = (Math.PI * 2 * idx) / Math.max(1, children.length) - Math.PI / 2;
         nextPositions[childId] = {
-          x: center.x + Math.cos(angle) * radius,
+          x: center.x + Math.cos(angle) * radius + hostXBias,
           y: center.y + Math.sin(angle) * radius,
         };
       });
@@ -136,34 +203,77 @@ export function NetworkMapFlow() {
           subnet: device?.subnet_cidr ?? node.subnet_cidr,
           lastSeenMs: device?.last_seen_ms,
           attachedCount: node.attached_count,
+          handleCount: node.node_type === "gateway" ? handleCountByGateway.get(node.id) ?? 16 : undefined,
           selected: focusedAgentId === (node.agent_id ?? node.id),
           onHover: setHoveredId,
           onSelect: (id: string) => setFocusedAgentId(node.agent_id ?? id),
         },
       };
     });
-  }, [topology.nodes, devicesByAgent, focusedAgentId, setFocusedAgentId]);
+  }, [topology.nodes, devicesByAgent, focusedAgentId, setFocusedAgentId, handleCountByGateway]);
 
   const edges: Edge[] = useMemo(() => {
-    return topology.edges.map((edge) => {
-      const highlighted = hoveredId === edge.child_id || hoveredId === edge.parent_id;
-      return {
+    return topology.edges.reduce<Edge[]>((acc, edge) => {
+      const parentNode = nodeById.get(edge.parent_id);
+      const childNode = nodeById.get(edge.child_id);
+      if (!parentNode || !childNode) {
+        return acc;
+      }
+
+      const orderedChildren = attachmentOrderByParent.get(edge.parent_id) ?? [];
+      const index = orderedChildren.indexOf(edge.child_id);
+      const count = orderedChildren.length;
+
+      if (childNode.node_type === "subnet") {
+        return acc;
+      }
+
+      const laneSpacing = parentNode.node_type === "gateway" ? 10 : 8;
+      const rawLaneOffset = count > 0 ? (index - (count - 1) / 2) * laneSpacing : 0;
+      const laneOffset = Math.max(-48, Math.min(48, rawLaneOffset));
+
+      const connectedToHovered = hoveredId ? hoveredId === edge.child_id || hoveredId === edge.parent_id : false;
+      const dimmed = hoveredId ? !connectedToHovered : false;
+      const highlighted = connectedToHovered || focusedAgentId === childNode.agent_id;
+
+      const safeIndex = index >= 0 ? index : 0;
+      const gatewayLike = parentNode.node_type === "gateway" || parentNode.node_type === "unknown_hub" || parentNode.node_type === "switch";
+      const handleCount = gatewayLike ? handleCountByGateway.get(edge.parent_id) ?? 16 : 1;
+      const targetHandle = gatewayLike ? `t-${safeIndex % handleCount}` : "t-0";
+
+      const hostIp = childNode.agent_id ? devicesByAgent.get(childNode.agent_id)?.ip ?? devicesByAgent.get(childNode.agent_id)?.ips[0] : undefined;
+
+      const renderedEdge: Edge = {
         id: edge.id,
         source: edge.child_id,
         target: edge.parent_id,
-        type: "smoothstep",
+        sourceHandle: "s-0",
+        targetHandle,
+        type: gatewayLike ? "labscanOrthogonal" : "step",
         animated: false,
+        data: {
+          laneOffset,
+          dimmed,
+          highlighted,
+          method: edge.method,
+          markerLabel: childNode.node_type === "host" ? edgeLabelFromIp(hostIp) : undefined,
+        },
         style: {
-          stroke: edge.method === "heuristic" ? "#f59e0b" : highlighted ? "#67e8f9" : "#a3eef7",
-          strokeOpacity: highlighted ? 0.98 : 0.9,
-          strokeWidth: highlighted ? 4.8 : 3.8,
+          stroke: edge.method === "heuristic" ? "#f59e0b" : highlighted ? "#67e8f9" : "#9ad9e2",
+          strokeOpacity: dimmed ? 0.2 : highlighted ? 0.96 : 0.82,
+          strokeWidth: highlighted ? 5.2 : 3.6,
           filter: highlighted
             ? "drop-shadow(0 0 8px rgba(103,232,249,0.45))"
-            : "drop-shadow(0 0 4px rgba(15,23,42,0.45))",
+            : dimmed
+              ? "none"
+              : "drop-shadow(0 0 4px rgba(15,23,42,0.35))",
         },
       };
-    });
-  }, [topology.edges, hoveredId]);
+
+      acc.push(renderedEdge);
+      return acc;
+    }, []);
+  }, [topology.edges, topology.nodes, nodeById, attachmentOrderByParent, hoveredId, focusedAgentId, handleCountByGateway, devicesByAgent]);
 
   const hoveredNode = hoveredId ? topology.nodes.find((node) => node.id === hoveredId) : undefined;
   const hoveredDevice = hoveredNode?.agent_id ? devicesByAgent.get(hoveredNode.agent_id) : undefined;
@@ -176,6 +286,7 @@ export function NetworkMapFlow() {
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable
