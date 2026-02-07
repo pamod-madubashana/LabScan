@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import ReactFlow, { Background, Controls, MiniMap, type Edge, type Node, type NodeTypes } from "reactflow";
+import { BackgroundVariant } from "reactflow";
 import "reactflow/dist/style.css";
 import { formatSince, useLabScan } from "@/lib/labscan";
 import { LabscanNode } from "./LabscanNode";
@@ -153,9 +154,12 @@ export function NetworkMapFlow() {
         type: "smoothstep",
         animated: false,
         style: {
-          stroke: edge.method === "heuristic" ? "#f59e0b" : highlighted ? "#38bdf8" : "#334155",
-          strokeOpacity: highlighted ? 0.95 : 0.72,
-          strokeWidth: highlighted ? 2.8 : 2.2,
+          stroke: edge.method === "heuristic" ? "#f59e0b" : highlighted ? "#67e8f9" : "#0f172a",
+          strokeOpacity: highlighted ? 0.98 : 0.9,
+          strokeWidth: highlighted ? 4.8 : 3.8,
+          filter: highlighted
+            ? "drop-shadow(0 0 8px rgba(103,232,249,0.45))"
+            : "drop-shadow(0 0 4px rgba(15,23,42,0.45))",
         },
       };
     });
@@ -181,7 +185,7 @@ export function NetworkMapFlow() {
         maxZoom={1.75}
         className="bg-transparent labscan-map"
       >
-        <Background variant={1} gap={24} size={1.1} color="rgba(148,163,184,0.20)" />
+        <Background variant={BackgroundVariant.Dots} gap={24} size={1.1} color="rgba(148,163,184,0.20)" />
         <MiniMap pannable zoomable nodeStrokeWidth={2} className="!bg-card/80 !border !border-border/60 !rounded-md" maskColor="rgba(2,6,23,0.65)" />
         <Controls className="!bg-card/80 !border !border-border/60 !rounded-md" showInteractive={false} />
       </ReactFlow>
