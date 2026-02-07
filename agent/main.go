@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -33,10 +36,15 @@ const (
 )
 
 type PersistedConfig struct {
-	AgentID       string `json:"agent_id"`
 	AdminIP       string `json:"admin_ip"`
 	Secret        string `json:"secret"`
 	ProvisionedAt int64  `json:"provisioned_at"`
+}
+
+type AgentIdentity struct {
+	AgentID     string `json:"agent_id"`
+	Fingerprint string `json:"fingerprint"`
+	CreatedAt   int64  `json:"created_at"`
 }
 
 type ProvisionMessage struct {
@@ -64,14 +72,17 @@ type WireMessage struct {
 }
 
 type RegisterPayload struct {
-	AgentID  string       `json:"agent_id"`
-	Secret   string       `json:"secret"`
-	Hostname string       `json:"hostname"`
-	IPs      []string     `json:"ips"`
-	OS       string       `json:"os"`
-	Arch     string       `json:"arch"`
-	Version  string       `json:"version"`
-	Network  NetworkFacts `json:"network"`
+	AgentID     string       `json:"agent_id"`
+	Fingerprint string       `json:"fingerprint"`
+	Secret      string       `json:"secret"`
+	Hostname    string       `json:"hostname"`
+	IPs         []string     `json:"ips"`
+	MACs        []string     `json:"macs,omitempty"`
+	OS          string       `json:"os"`
+	Arch        string       `json:"arch"`
+	Version     string       `json:"version"`
+	StartedAt   int64        `json:"started_at"`
+	Network     NetworkFacts `json:"network"`
 }
 
 type HeartbeatPayload struct {
@@ -117,10 +128,13 @@ type RegisteredResponse struct {
 }
 
 type AgentProfile struct {
-	AgentID  string
-	Hostname string
-	IPs      []string
-	IsFake   bool
+	AgentID     string
+	Fingerprint string
+	Hostname    string
+	IPs         []string
+	MACs        []string
+	StartedAt   int64
+	IsFake      bool
 }
 
 type AgentClient struct {
@@ -149,40 +163,59 @@ type ProbeState struct {
 
 func main() {
 	fake := flag.Bool("fake", false, "Run in fake provisioning mode")
+	identityPath := flag.String("identity", "", "Override identity file path")
 	flag.Parse()
 
 	if *fake {
-		runFakeMode()
+		runFakeMode(*identityPath)
 		return
 	}
 
-	runNormalMode()
+	runNormalMode(*identityPath)
 }
 
-func runNormalMode() {
+func runNormalMode(identityPath string) {
 	hostname, _ := os.Hostname()
-	agentID := stableAgentID("")
+	identity, err := loadOrCreateIdentity(resolveIdentityPath(identityPath), "")
+	if err != nil {
+		log.Fatalf("failed to initialize agent identity: %v", err)
+	}
 
 	for {
-		cfg, err := waitForProvision(agentID, hostname)
+		cfg, err := waitForProvision(identity.AgentID, hostname)
 		if err != nil {
 			log.Printf("provisioning listener error: %v", err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		profile := AgentProfile{AgentID: cfg.AgentID, Hostname: hostname, IPs: localIPv4s(), IsFake: false}
+		profile := AgentProfile{
+			AgentID:     identity.AgentID,
+			Fingerprint: identity.Fingerprint,
+			Hostname:    hostname,
+			IPs:         localIPv4s(),
+			MACs:        localMACs(),
+			StartedAt:   nowMS(),
+			IsFake:      false,
+		}
 		client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, jitterDuration(5, 10))
 		_ = client.runWithSleepLifecycle(context.Background())
 	}
 }
 
-func runFakeMode() {
+func runFakeMode(identityPath string) {
 	hostname, _ := os.Hostname()
-	controllerID := stableAgentID("")
+	controllerIdentity, err := loadOrCreateIdentity(resolveIdentityPath(identityPath), "")
+	if err != nil {
+		log.Fatalf("failed to initialize controller identity: %v", err)
+	}
+	baseFingerprint := controllerIdentity.Fingerprint
+	if strings.TrimSpace(baseFingerprint) == "" {
+		baseFingerprint = computeDeviceFingerprint()
+	}
 
 	for {
-		cfg, err := waitForProvision(controllerID, hostname)
+		cfg, err := waitForProvision(controllerIdentity.AgentID, hostname)
 		if err != nil {
 			log.Printf("failed provisioning in fake mode: %v", err)
 			time.Sleep(2 * time.Second)
@@ -194,11 +227,19 @@ func runFakeMode() {
 		disconnectCh := make(chan struct{}, 1)
 
 		for i := 1; i <= fakeAgentCount; i++ {
+			identity, idErr := loadOrCreateIdentity(fakeIdentityPath(i, identityPath), fakeFingerprint(baseFingerprint, i))
+			if idErr != nil {
+				log.Printf("failed loading fake identity %d: %v", i, idErr)
+				continue
+			}
 			profile := AgentProfile{
-				AgentID:  uuid.NewString(),
-				Hostname: fmt.Sprintf("LABSCAN-FAKE-%03d", i),
-				IPs:      []string{fmt.Sprintf("192.168.1.%d", 100+i)},
-				IsFake:   true,
+				AgentID:     identity.AgentID,
+				Fingerprint: identity.Fingerprint,
+				Hostname:    fmt.Sprintf("LABSCAN-FAKE-%03d", i),
+				IPs:         []string{fmt.Sprintf("192.168.1.%d", 100+i)},
+				MACs:        []string{fakeMACForIndex(i)},
+				StartedAt:   nowMS(),
+				IsFake:      true,
 			}
 
 			client := newAgentClient(profile, cfg.AdminIP, cfg.Secret, jitterDuration(5, 10))
@@ -251,7 +292,6 @@ func waitForProvision(agentID, hostname string) (*PersistedConfig, error) {
 		}
 
 		cfg := &PersistedConfig{
-			AgentID:       stableAgentID(agentID),
 			AdminIP:       provision.AdminIP,
 			Secret:        provision.Secret,
 			ProvisionedAt: nowMS(),
@@ -264,7 +304,7 @@ func waitForProvision(agentID, hostname string) (*PersistedConfig, error) {
 		ack := ProvisionAck{
 			Type:    "LABSCAN_PROVISION_ACK",
 			V:       1,
-			AgentID: cfg.AgentID,
+			AgentID: agentID,
 			Host:    hostname,
 			Nonce:   provision.Nonce,
 			TS:      nowMS(),
@@ -344,14 +384,17 @@ func (c *AgentClient) runSession(parent context.Context) (bool, error) {
 	defer cancel()
 
 	if err := c.send("register", RegisterPayload{
-		AgentID:  c.profile.AgentID,
-		Secret:   c.secret,
-		Hostname: c.profile.Hostname,
-		IPs:      c.profile.IPs,
-		OS:       runtime.GOOS,
-		Arch:     runtime.GOARCH,
-		Version:  agentVersion,
-		Network:  c.collectAndStoreNetworkFacts(true),
+		AgentID:     c.profile.AgentID,
+		Fingerprint: c.profile.Fingerprint,
+		Secret:      c.secret,
+		Hostname:    c.profile.Hostname,
+		IPs:         c.profile.IPs,
+		MACs:        c.profile.MACs,
+		OS:          runtime.GOOS,
+		Arch:        runtime.GOARCH,
+		Version:     agentVersion,
+		StartedAt:   c.profile.StartedAt,
+		Network:     c.collectAndStoreNetworkFacts(true),
 	}); err != nil {
 		return false, err
 	}
@@ -688,9 +731,6 @@ func loadConfig() (*PersistedConfig, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
-	if cfg.AgentID == "" {
-		cfg.AgentID = uuid.NewString()
-	}
 	return &cfg, nil
 }
 
@@ -702,14 +742,141 @@ func saveConfig(cfg *PersistedConfig) error {
 	return os.WriteFile(configPath, data, 0o644)
 }
 
-func stableAgentID(existing string) string {
-	if strings.TrimSpace(existing) != "" {
-		return existing
+func resolveIdentityPath(override string) string {
+	if strings.TrimSpace(override) != "" {
+		return override
 	}
-	if cfg, err := loadConfig(); err == nil && strings.TrimSpace(cfg.AgentID) != "" {
-		return cfg.AgentID
+	if appData := os.Getenv("APPDATA"); strings.TrimSpace(appData) != "" {
+		return filepath.Join(appData, "LabScan", "agent_identity.json")
 	}
-	return uuid.NewString()
+	if dir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
+		return filepath.Join(dir, "LabScan", "agent_identity.json")
+	}
+	return "labscan_identity.json"
+}
+
+func fakeIdentityPath(index int, override string) string {
+	base := ""
+	if strings.TrimSpace(override) != "" {
+		base = filepath.Join(filepath.Dir(override), "fake")
+		return filepath.Join(base, fmt.Sprintf("agent_%03d.json", index))
+	}
+	if appData := os.Getenv("APPDATA"); strings.TrimSpace(appData) != "" {
+		base = filepath.Join(appData, "LabScan", "fake")
+	} else if dir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
+		base = filepath.Join(dir, "LabScan", "fake")
+	} else {
+		base = "fake"
+	}
+	return filepath.Join(base, fmt.Sprintf("agent_%03d.json", index))
+}
+
+func loadOrCreateIdentity(path string, defaultFingerprint string) (*AgentIdentity, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("identity path is empty")
+	}
+
+	if data, err := os.ReadFile(path); err == nil {
+		var identity AgentIdentity
+		if jsonErr := json.Unmarshal(data, &identity); jsonErr == nil {
+			if strings.TrimSpace(identity.AgentID) == "" {
+				identity.AgentID = uuid.NewString()
+			}
+			if strings.TrimSpace(identity.Fingerprint) == "" {
+				identity.Fingerprint = chooseFingerprint(defaultFingerprint)
+			}
+			if identity.CreatedAt == 0 {
+				identity.CreatedAt = nowMS()
+			}
+			if writeErr := writeIdentity(path, &identity); writeErr != nil {
+				log.Printf("warning: failed to rewrite identity file: %v", writeErr)
+			}
+			return &identity, nil
+		}
+	}
+
+	identity := &AgentIdentity{
+		AgentID:     uuid.NewString(),
+		Fingerprint: chooseFingerprint(defaultFingerprint),
+		CreatedAt:   nowMS(),
+	}
+	if err := writeIdentity(path, identity); err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
+func writeIdentity(path string, identity *AgentIdentity) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(identity, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func chooseFingerprint(defaultFingerprint string) string {
+	if strings.TrimSpace(defaultFingerprint) != "" {
+		return defaultFingerprint
+	}
+	return computeDeviceFingerprint()
+}
+
+func computeDeviceFingerprint() string {
+	hostname, _ := os.Hostname()
+	machineID := windowsMachineGuid()
+	primaryMAC := primaryStableMAC()
+	if machineID == "" {
+		machineID = "no-machine-guid"
+	}
+	if primaryMAC == "" {
+		primaryMAC = "no-mac"
+	}
+	raw := fmt.Sprintf("labscan:%s:%s:%s", machineID, primaryMAC, strings.ToLower(strings.TrimSpace(hostname)))
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func windowsMachineGuid() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	out, err := exec.Command("reg", "query", `HKLM\\SOFTWARE\\Microsoft\\Cryptography`, "/v", "MachineGuid").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.Contains(strings.ToLower(trimmed), "machineguid") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) > 0 {
+			return strings.ToLower(fields[len(fields)-1])
+		}
+	}
+	return ""
+}
+
+func primaryStableMAC() string {
+	for _, mac := range localMACs() {
+		if mac != "" {
+			return mac
+		}
+	}
+	return ""
+}
+
+func fakeFingerprint(baseFingerprint string, index int) string {
+	raw := fmt.Sprintf("%s:fake:%d", baseFingerprint, index)
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func fakeMACForIndex(index int) string {
+	return fmt.Sprintf("02:00:00:00:00:%02x", index&0xff)
 }
 
 func localIPv4s() []string {
@@ -744,6 +911,39 @@ func localIPv4s() []string {
 		return []string{"127.0.0.1"}
 	}
 	return ips
+}
+
+func localMACs() []string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	macs := make([]string, 0)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		mac := normalizeMAC(iface.HardwareAddr.String())
+		if mac == "" || likelyVirtualInterface(iface.Name) {
+			continue
+		}
+		macs = append(macs, mac)
+	}
+	if len(macs) == 0 {
+		return nil
+	}
+	return macs
+}
+
+func likelyVirtualInterface(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	virtualHints := []string{"veth", "virtual", "vmware", "vbox", "hyper-v", "loopback", "docker", "tailscale", "zerotier"}
+	for _, hint := range virtualHints {
+		if strings.Contains(lower, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 func collectNetworkFacts(includeARP bool) NetworkFacts {

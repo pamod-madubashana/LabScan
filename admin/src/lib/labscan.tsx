@@ -6,7 +6,9 @@ import { logger } from "@/lib/logger";
 export type DeviceStatus = "online" | "idle" | "scanning" | "offline";
 
 export interface DeviceRecord {
+  device_key: string;
   agent_id: string;
+  fingerprint?: string | null;
   hostname: string;
   ips: string[];
   os: string;
@@ -134,8 +136,8 @@ const LabScanContext = createContext<LabScanContextValue | null>(null);
 const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 function mergeStableDeviceList(current: DeviceRecord[], incoming: DeviceRecord[]): DeviceRecord[] {
-  const incomingById = new Map(incoming.map((item) => [item.agent_id, item]));
-  const currentById = new Map(current.map((item) => [item.agent_id, item]));
+  const incomingById = new Map(incoming.map((item) => [deviceStableKey(item), item]));
+  const currentById = new Map(current.map((item) => [deviceStableKey(item), item]));
 
   const currentIds = new Set(currentById.keys());
   const incomingIds = new Set(incomingById.keys());
@@ -162,10 +164,14 @@ function mergeStableDeviceList(current: DeviceRecord[], incoming: DeviceRecord[]
   }
 
   if (!topologyChanged && !ipChanged) {
-    return current.map((item) => incomingById.get(item.agent_id) ?? item);
+    return current.map((item) => incomingById.get(deviceStableKey(item)) ?? item);
   }
 
   return [...incoming].sort(compareDevicesByIp);
+}
+
+function deviceStableKey(device: DeviceRecord): string {
+  return device.device_key || device.fingerprint || device.agent_id;
 }
 
 function ipToSortableNumber(ip: string): number | null {
@@ -260,13 +266,14 @@ export function LabScanProvider({ children }: { children: ReactNode }) {
         });
 
         const unlistenDeviceUpsert = await listen<{ device: DeviceRecord }>("device_upsert", (event) => {
+          const incomingKey = deviceStableKey(event.payload.device);
           setState((prev) => ({
             ...prev,
             devices: mergeStableDeviceList(
               prev.devices,
-              prev.devices.some((device) => device.agent_id === event.payload.device.agent_id)
+              prev.devices.some((device) => deviceStableKey(device) === incomingKey)
                 ? prev.devices.map((device) =>
-                    device.agent_id === event.payload.device.agent_id ? event.payload.device : device,
+                    deviceStableKey(device) === incomingKey ? event.payload.device : device,
                   )
                 : [...prev.devices, event.payload.device],
             ),

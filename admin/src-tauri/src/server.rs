@@ -55,7 +55,9 @@ pub struct ServerStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRecord {
+    pub device_key: String,
     pub agent_id: String,
+    pub fingerprint: Option<String>,
     pub hostname: String,
     pub ips: Vec<String>,
     pub os: String,
@@ -235,11 +237,17 @@ struct WireMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegisterPayload {
     agent_id: String,
+    #[serde(default)]
+    fingerprint: String,
     secret: String,
     hostname: String,
     ips: Vec<String>,
+    #[serde(default)]
+    macs: Vec<String>,
     os: String,
     version: String,
+    #[serde(default)]
+    started_at: i64,
     #[serde(default)]
     network: NetworkFactsPayload,
 }
@@ -274,6 +282,7 @@ struct RuntimeState {
     pair_token: String,
     devices: HashMap<String, DeviceRecord>,
     device_order: Vec<String>,
+    fingerprint_index: HashMap<String, String>,
     tasks: HashMap<String, TaskRecord>,
     logs: VecDeque<LogEvent>,
     activity: VecDeque<ActivityEvent>,
@@ -304,6 +313,7 @@ impl ServerManager {
                 pair_token: Uuid::new_v4().to_string(),
                 devices: HashMap::new(),
                 device_order: Vec::new(),
+                fingerprint_index: HashMap::new(),
                 tasks: HashMap::new(),
                 logs: VecDeque::new(),
                 activity: VecDeque::new(),
@@ -924,30 +934,53 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                 secret_ok
             );
 
-            let response = if secret_ok {
-                json!({"ok": true, "server_time": now_ms()})
-            } else {
-                json!({"ok": false, "error": "invalid shared secret", "server_time": now_ms()})
-            };
-
-            let _ = tx.send(Message::Text(
-                json!({
-                    "type": "registered",
-                    "ts": now_ms(),
-                    "agent_id": payload.agent_id,
-                    "payload": response
-                })
-                .to_string()
-                .into(),
-            ));
-
             if !secret_ok {
+                let _ = tx.send(Message::Text(
+                    json!({
+                        "type": "registered",
+                        "ts": now_ms(),
+                        "agent_id": payload.agent_id,
+                        "payload": {"ok": false, "error": "invalid shared secret", "server_time": now_ms()}
+                    })
+                    .to_string()
+                    .into(),
+                ));
                 break;
             }
 
             let now = now_ms();
-            let (device, was_new, old_status) = {
+            let (device, was_new, old_status, adopted_old_agent) = {
                 let mut guard = state.manager.inner.lock().await;
+                let fingerprint = clean_non_empty_owned(&payload.fingerprint);
+
+                let adopt_key = fingerprint.as_ref().and_then(|fp| {
+                    guard.fingerprint_index.get(fp).cloned().or_else(|| {
+                        guard
+                            .devices
+                            .iter()
+                            .find(|(_, d)| d.fingerprint.as_deref() == Some(fp.as_str()))
+                            .map(|(key, _)| key.clone())
+                    })
+                });
+
+                let mut adopted_old_agent: Option<String> = None;
+                if let Some(old_key) = adopt_key {
+                    if old_key != payload.agent_id {
+                        if let Some(mut adopted) = guard.devices.remove(&old_key) {
+                            adopted_old_agent = Some(adopted.agent_id.clone());
+                            adopted.agent_id = payload.agent_id.clone();
+                            guard.devices.insert(payload.agent_id.clone(), adopted);
+                            guard.connections.remove(&old_key);
+                            guard.last_device_emit_ms.remove(&old_key);
+                            if let Some(slot) =
+                                guard.device_order.iter_mut().find(|id| **id == old_key)
+                            {
+                                *slot = payload.agent_id.clone();
+                            }
+                        }
+                    }
+                }
+
                 guard
                     .connections
                     .insert(payload.agent_id.clone(), tx.clone());
@@ -956,51 +989,93 @@ async fn handle_agent_socket(socket: WebSocket, state: HttpState, remote: Socket
                     guard.device_order.push(payload.agent_id.clone());
                 }
 
-                let entry = guard
-                    .devices
-                    .entry(payload.agent_id.clone())
-                    .or_insert(DeviceRecord {
-                        agent_id: payload.agent_id.clone(),
-                        hostname: payload.hostname.clone(),
-                        ips: payload.ips.clone(),
-                        os: payload.os.clone(),
-                        version: payload.version.clone(),
-                        status: "online".to_string(),
-                        last_seen_ms: now,
-                        internet_reachable: None,
-                        dns_ok: None,
-                        gateway_reachable: None,
-                        latency_ms: None,
-                        last_internet_change_ms: None,
-                        last_dns_change_ms: None,
-                        first_seen_ms: now,
-                        ip: None,
-                        subnet_cidr: None,
-                        default_gateway_ip: None,
-                        interface_type: None,
-                        mac: None,
-                        gateway_mac: None,
-                        dhcp_server_ip: None,
-                        ssid: None,
-                        arp_snapshot: Vec::new(),
-                    });
+                let fp_for_index = fingerprint.clone();
+                let device = {
+                    let entry = guard
+                        .devices
+                        .entry(payload.agent_id.clone())
+                        .or_insert(DeviceRecord {
+                            device_key: fingerprint
+                                .as_ref()
+                                .map(|fp| format!("fp:{}", fp))
+                                .unwrap_or_else(|| format!("agent:{}", payload.agent_id)),
+                            agent_id: payload.agent_id.clone(),
+                            fingerprint: fingerprint.clone(),
+                            hostname: payload.hostname.clone(),
+                            ips: payload.ips.clone(),
+                            os: payload.os.clone(),
+                            version: payload.version.clone(),
+                            status: "online".to_string(),
+                            last_seen_ms: now,
+                            internet_reachable: None,
+                            dns_ok: None,
+                            gateway_reachable: None,
+                            latency_ms: None,
+                            last_internet_change_ms: None,
+                            last_dns_change_ms: None,
+                            first_seen_ms: now,
+                            ip: None,
+                            subnet_cidr: None,
+                            default_gateway_ip: None,
+                            interface_type: None,
+                            mac: None,
+                            gateway_mac: None,
+                            dhcp_server_ip: None,
+                            ssid: None,
+                            arp_snapshot: Vec::new(),
+                        });
 
-                let old_status = entry.status.clone();
-                entry.hostname = payload.hostname;
-                entry.ips = payload.ips;
-                entry.os = payload.os;
-                entry.version = payload.version;
-                entry.status = "online".to_string();
-                entry.last_seen_ms = now;
-                apply_network_payload(entry, &payload.network);
-                (entry.clone(), was_new, old_status)
+                    if entry.device_key.is_empty() {
+                        entry.device_key = fingerprint
+                            .as_ref()
+                            .map(|fp| format!("fp:{}", fp))
+                            .unwrap_or_else(|| format!("agent:{}", payload.agent_id));
+                    }
+                    if let Some(fp) = fingerprint.clone() {
+                        entry.fingerprint = Some(fp);
+                    }
+
+                    let old_status = entry.status.clone();
+                    entry.hostname = payload.hostname;
+                    entry.ips = payload.ips;
+                    entry.os = payload.os;
+                    entry.version = payload.version;
+                    entry.status = "online".to_string();
+                    entry.last_seen_ms = now;
+                    apply_network_payload(entry, &payload.network);
+                    (entry.clone(), old_status)
+                };
+
+                if let Some(fp) = fp_for_index {
+                    guard.fingerprint_index.insert(fp, payload.agent_id.clone());
+                }
+                (device.0, was_new, device.1, adopted_old_agent)
             };
 
             registered_agent_id = Some(device.agent_id.clone());
+
+            let _ = tx.send(Message::Text(
+                json!({
+                    "type": "registered",
+                    "ts": now_ms(),
+                    "agent_id": device.agent_id,
+                    "payload": {"ok": true, "server_time": now_ms(), "canonical_id": device.device_key}
+                })
+                .to_string()
+                .into(),
+            ));
+
             state
                 .manager
                 .emit_device_upsert_if_needed(&state.app, device.clone(), true)
                 .await;
+
+            if let Some(old_agent) = adopted_old_agent {
+                state
+                    .manager
+                    .emit_device_remove(&state.app, old_agent)
+                    .await;
+            }
 
             if was_new {
                 state
@@ -1415,7 +1490,7 @@ fn build_topology_snapshot(
     *attachment_count.entry(admin_parent.0).or_insert(0) += 1;
 
     for host in host_records {
-        let node_id = format!("host:{}", host.agent_id);
+        let node_id = format!("host:{}", host.device_key);
         nodes.push(TopologyNode {
             id: node_id.clone(),
             node_type: "host".to_string(),
@@ -1549,7 +1624,7 @@ fn compare_device_topology_order(a: &DeviceRecord, b: &DeviceRecord) -> Ordering
             if host_cmp != Ordering::Equal {
                 host_cmp
             } else {
-                a.agent_id.cmp(&b.agent_id)
+                a.device_key.cmp(&b.device_key)
             }
         }
     }
