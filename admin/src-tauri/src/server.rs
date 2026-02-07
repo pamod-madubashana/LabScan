@@ -99,6 +99,7 @@ pub struct TopologyNode {
     pub id: String,
     pub node_type: String,
     pub label: String,
+    pub ip: Option<String>,
     pub subnet_cidr: Option<String>,
     pub gateway_ip: Option<String>,
     pub agent_id: Option<String>,
@@ -1299,6 +1300,7 @@ fn build_topology_snapshot(
                 id: subnet_id,
                 node_type: "subnet".to_string(),
                 label: subnet.clone(),
+                ip: None,
                 subnet_cidr: Some(subnet.clone()),
                 gateway_ip: None,
                 agent_id: None,
@@ -1345,6 +1347,7 @@ fn build_topology_snapshot(
             id: gateway_id.clone(),
             node_type: "gateway".to_string(),
             label: format!("Gateway {}", gateway_ip),
+            ip: Some(gateway_ip.clone()),
             subnet_cidr: subnet.clone(),
             gateway_ip: Some(gateway_ip.clone()),
             agent_id: None,
@@ -1374,6 +1377,7 @@ fn build_topology_snapshot(
         id: admin_id.clone(),
         node_type: "admin".to_string(),
         label: "Admin".to_string(),
+        ip: Some(admin_ip.clone()),
         subnet_cidr: admin_subnet.clone(),
         gateway_ip: admin_gateway.clone(),
         agent_id: None,
@@ -1416,6 +1420,7 @@ fn build_topology_snapshot(
             id: node_id.clone(),
             node_type: "host".to_string(),
             label: host.hostname.clone(),
+            ip: host.ip.clone().or_else(|| host.ips.first().cloned()),
             subnet_cidr: host.subnet_cidr.clone(),
             gateway_ip: host.default_gateway_ip.clone(),
             agent_id: Some(host.agent_id.clone()),
@@ -1500,6 +1505,7 @@ fn ensure_unknown_hub_node(
         id: hub_id.clone(),
         node_type: "unknown_hub".to_string(),
         label: "Unknown Hub".to_string(),
+        ip: None,
         subnet_cidr: subnet.clone(),
         gateway_ip: None,
         agent_id: None,
@@ -1588,9 +1594,10 @@ fn topology_key(snapshot: &TopologySnapshot) -> String {
         .iter()
         .map(|n| {
             format!(
-                "{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}",
                 n.id,
                 n.node_type,
+                n.ip.clone().unwrap_or_default(),
                 n.subnet_cidr.clone().unwrap_or_default(),
                 n.gateway_ip.clone().unwrap_or_default()
             )

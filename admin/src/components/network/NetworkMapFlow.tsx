@@ -188,6 +188,7 @@ export function NetworkMapFlow() {
   const nodes: Node[] = useMemo(() => {
     return topology.nodes.map((node) => {
       const device = node.agent_id ? devicesByAgent.get(node.agent_id) : undefined;
+      const nodeIp = device?.ip ?? device?.ips[0] ?? node.ip ?? (node.node_type === "gateway" ? node.gateway_ip : undefined);
       return {
         id: node.id,
         type: "labscanNode",
@@ -195,7 +196,7 @@ export function NetworkMapFlow() {
         data: {
           label: node.label,
           nodeType: node.node_type,
-          ip: device?.ip ?? device?.ips[0] ?? node.gateway_ip,
+          ip: nodeIp,
           status: device?.status,
           internet: device?.internet_reachable,
           dns: device?.dns_ok,
@@ -277,6 +278,7 @@ export function NetworkMapFlow() {
 
   const hoveredNode = hoveredId ? topology.nodes.find((node) => node.id === hoveredId) : undefined;
   const hoveredDevice = hoveredNode?.agent_id ? devicesByAgent.get(hoveredNode.agent_id) : undefined;
+  const hoveredIp = hoveredDevice?.ip ?? hoveredDevice?.ips[0] ?? hoveredNode?.ip ?? (hoveredNode?.node_type === "gateway" ? hoveredNode.gateway_ip : undefined);
 
   return (
     <div className="relative h-full min-h-[520px] w-full rounded-lg border border-border/50 bg-card/40 overflow-hidden">
@@ -304,7 +306,7 @@ export function NetworkMapFlow() {
       {hoveredNode && (
         <div className="absolute right-4 top-4 w-72 glass-panel p-3 text-xs">
           <p className="text-foreground font-semibold">{hoveredNode.label}</p>
-          <p className="text-muted-foreground font-mono mt-0.5">{hoveredDevice?.ip ?? hoveredDevice?.ips[0] ?? hoveredNode.gateway_ip ?? "-"}</p>
+          <p className="text-muted-foreground font-mono mt-0.5">{hoveredIp ?? "-"}</p>
           <div className="mt-2 space-y-1 text-muted-foreground">
             <p>Type: <span className="uppercase text-foreground">{hoveredNode.node_type}</span></p>
             <p>Gateway: {hoveredDevice?.default_gateway_ip ?? hoveredNode.gateway_ip ?? "Unknown"}</p>

@@ -34,6 +34,7 @@ export interface TopologyNode {
   id: string;
   node_type: "gateway" | "admin" | "host" | "switch" | "subnet" | "unknown_hub";
   label: string;
+  ip?: string | null;
   subnet_cidr?: string | null;
   gateway_ip?: string | null;
   agent_id?: string | null;
