@@ -154,7 +154,7 @@ export function NetworkMapFlow() {
         type: "smoothstep",
         animated: false,
         style: {
-          stroke: edge.method === "heuristic" ? "#f59e0b" : highlighted ? "#67e8f9" : "#0f172a",
+          stroke: edge.method === "heuristic" ? "#f59e0b" : highlighted ? "#67e8f9" : "#a3eef7",
           strokeOpacity: highlighted ? 0.98 : 0.9,
           strokeWidth: highlighted ? 4.8 : 3.8,
           filter: highlighted
