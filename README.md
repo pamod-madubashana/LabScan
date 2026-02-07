@@ -57,3 +57,16 @@ labscan-agent.exe -admin-url ws://<ADMIN_IP>:8787/ws/agent -secret labscan-dev-s
 - Realtime UI updates via Tauri events (`labscan://state`)
 - Agent reconnect with bounded exponential backoff
 - No remote command execution (by design)
+
+## Screenshots
+
+<div align="center">
+  <img src="screenshots/dashboard.png" width="800" alt="Dashboard Overview">
+  <p><em>Admin Dashboard - Overview of connected devices and network status</em></p>
+  
+  <img src="screenshots/devices.png" width="800" alt="Device Management">
+  <p><em>Device List - Detailed view of all monitored devices</em></p>
+  
+  <img src="screenshots/networkMap.png" width="800" alt="Network Map">
+  <p><em>Network Visualization - Topology view of connected devices</em></p>
+</div>
