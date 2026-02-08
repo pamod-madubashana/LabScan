@@ -29,14 +29,16 @@ npm install
 npm run tauri dev
 ```
 
-By default, the embedded server listens on `0.0.0.0:8787`.
+By default, the embedded server uses:
+- WebSocket endpoint: `ws://0.0.0.0:8148/ws/agent`
+- UDP discovery: port `8870` for multicast beacons
 
 ### 2) Start one or more agents
 
 ```bash
 cd agent
 go build -o labscan-agent.exe .
-labscan-agent.exe -admin-url ws://<ADMIN_IP>:8787/ws/agent -secret labscan-dev-secret
+labscan-agent.exe -admin-url ws://<ADMIN_IP>:8148/ws/agent -secret labscan-dev-secret
 ```
 
 ### 3) Verify flow in UI
@@ -45,10 +47,34 @@ labscan-agent.exe -admin-url ws://<ADMIN_IP>:8787/ws/agent -secret labscan-dev-s
 2. Select agent(s), dispatch `Ping`, `Port Scan`, or `ARP Snapshot`.
 3. Observe progress/results in **Tasks** and live events in **Logs**.
 
-## LAN/firewall notes (Windows)
+## Port Configuration
 
-- Allow inbound TCP port `8787` for the admin app.
-- Agents need outbound TCP access to admin host on `8787`.
+**Admin Server Ports:**
+- **WebSocket Communication**: `8148` (agent connections)
+- **UDP Discovery**: `8870` (multicast beacon listening)
+
+**Agent Communication:**
+- Outbound WebSocket connection to admin server on port `8148`
+- Local UDP listening on port `8870` for discovery beacons
+
+## Firewall Configuration
+
+**Windows:**
+- Allow inbound TCP port `8148` for admin app WebSocket
+- Allow inbound UDP port `8870` for discovery (optional)
+- Agents need outbound TCP access to admin host on `8148`
+
+**Linux/macOS:**
+```bash
+# Ubuntu/Debian
+sudo ufw allow 8148/tcp
+sudo ufw allow 8870/udp
+
+# CentOS/RHEL
+sudo firewall-cmd --permanent --add-port=8148/tcp
+sudo firewall-cmd --permanent --add-port=8870/udp
+sudo firewall-cmd --reload
+```
 
 ## Current scope
 
